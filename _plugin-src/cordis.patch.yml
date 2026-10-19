@@ -1,0 +1,5 @@
+# dsh-mobile-adaption bundle patch: one client-only plugin row.
+# 服务端半在 lib/index.js，浏览器半通过 package.json 的 dsh.client 声明发现。
+- insert:
+    - id: mobile-adaption
+      name: dsh-mobile-adaption

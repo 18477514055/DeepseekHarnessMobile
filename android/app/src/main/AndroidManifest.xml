@@ -1,0 +1,96 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+
+    <!--
+      ★ 存储权限（2026-10-19 为"工作区文件能和手机互通"而加）
+      用户需求原话：「经常把一些文件放进工作区里面，然后把一些文件从工作区里面拉出来」
+
+      ★★ 为什么用 WRITE_EXTERNAL_STORAGE 而不是 MANAGE_EXTERNAL_STORAGE：
+         本 App targetSdk=28（为让容器能 exec，见 build.gradle.kts 的说明）。
+         targetSdk<29 ⇒ **不受分区存储强制**，WRITE_EXTERNAL_STORAGE 直接给全盘读写。
+         而 MANAGE_EXTERNAL_STORAGE 是 API 30 才引入的，targetSdk=28 申请了也拿不到。
+
+      ★★★ 千万**不要**加 android:maxSdkVersion！
+         踩过（2026-10-19）：一开始写了 maxSdkVersion="32"，结果在 Android 16 上
+         系统直接把这两条权限**过滤掉**（`dumpsys` 里查不到、`pm grant` 无效），
+         表现为"能读不能写"（canRead=true / canWrite=false）。
+         targetSdk=28 的 App 本来就按旧规则给权限，加 maxSdkVersion 纯属自伤。
+    -->
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
+
+    <!--
+      ★★★ 2026-10-19：MANAGE_EXTERNAL_STORAGE（所有文件访问）
+
+      ★ 我一开始判断错了：以为它"要求 targetSdk>=30，所以 targetSdk=28 拿不到"。
+        实测推翻了这个说法 —— **Termux 自己就是 targetSdk=28，却拿到了 allow**：
+
+          $ cmd appops get com.termux MANAGE_EXTERNAL_STORAGE
+          Uid mode: MANAGE_EXTERNAL_STORAGE: allow
+          com.termux  targetSdk=28
+
+        ⇒ 它是**特殊的 appop**，由用户在系统设置「所有文件访问」里手动开启，
+           **不受 targetSdk 限制**。
+
+      ★ 用户的原话正好点破了这一点：
+        「我此前在 Termux，这个 dsh 也可以正常的去改写和把文件放到手机目录中」
+
+      ★ 声明它之后，用户在设置里开一次「允许访问所有文件」，
+        App 就能像 Termux 一样自由读写手机存储（这也是 Android 11+ 给
+        "文件管理器类应用" 的官方通道）。
+    -->
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
+
+
+
+    <application
+        android:allowBackup="false"
+        android:extractNativeLibs="true"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:usesCleartextTraffic="true"
+        android:requestLegacyExternalStorage="false"
+        android:theme="@style/Theme.DshMobile">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:configChanges="orientation|screenSize|keyboardHidden|screenLayout|smallestScreenSize"
+            android:windowSoftInputMode="adjustResize"
+            android:theme="@style/Theme.DshMobile">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- ★ specialUse：dataSync 在 targetSdk>=35 时后台累计 6 小时会被系统停掉，
+             specialUse 没有时长上限。这是保活三件套的第 1 条。 -->
+        <service
+            android:name=".DshService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse"
+            android:stopWithTask="false">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Runs a local Linux container (proot) hosting the DeepSeek Harness web service on 127.0.0.1. The container is the product's runtime, not a background sync." />
+        </service>
+
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
+    </application>
+</manifest>

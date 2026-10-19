@@ -1,0 +1,434 @@
+package com.dsh.mobile;
+
+import android.app.Notification;
+import android.app.NotificationChannel;
+import android.app.NotificationManager;
+import android.app.PendingIntent;
+import android.app.Service;
+import android.content.Context;
+import android.content.Intent;
+import android.os.Build;
+import android.os.IBinder;
+import android.os.PowerManager;
+import android.util.Log;
+
+import androidx.core.app.NotificationCompat;
+
+import java.io.BufferedReader;
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.io.InputStreamReader;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.nio.charset.StandardCharsets;
+
+/**
+ * 前台服务：拉起 proot 容器里的 DSH，并**保活**。
+ *
+ * ★★ 保活三件套（§D3 / docs/01）：
+ *   ① 前台服务类型 specialUse（在 manifest 里声明）—— dataSync 有 6 小时上限，specialUse 没有
+ *   ② 进程内拿 PARTIAL_WAKE_LOCK —— 不加的话 MIUI 会把整个 App 判为可回收
+ *      （实测证据：am_kill [0,11436,com.termux,200,SwipeUpClean,160028]）
+ *   ③ 引导用户开白名单 —— 见 MainActivity
+ *
+ * ★ 不实现开机自启（用户明确要求：容易被安卓盯上）。
+ */
+public class DshService extends Service {
+    private static final String TAG = "DshService";
+    private static final String CH_ID = "dsh_service";
+    private static final int CH_NOTIFY_ID = 1001;
+
+    public static final String ACTION_START = "com.dsh.mobile.START";
+    public static final String ACTION_STOP = "com.dsh.mobile.STOP";
+    /** 服务把状态广播出去给 Activity 用（简单起见用静态字段 + 回调）。 */
+    public static volatile boolean running = false;
+    public static volatile String lastStatus = "";
+    /** 就绪后的完整 URL（含本次启动真实生成的 token）。MainActivity 读它。 */
+    public static volatile String readyUrl = "";
+
+    private Process proc;
+    private PowerManager.WakeLock wakeLock;
+    private Thread runner;
+    private NotificationManager nm;
+
+    @Override
+    public void onCreate() {
+        super.onCreate();
+        nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+        createChannel();
+    }
+
+    @Override
+    public int onStartCommand(Intent intent, int flags, int startId) {
+        String action = intent == null ? ACTION_START : intent.getAction();
+        if (ACTION_STOP.equals(action)) {
+            stopSelf();
+            return START_NOT_STICKY;
+        }
+
+        startForeground(CH_NOTIFY_ID, buildNotification("正在启动容器…"));
+
+        // ★ WakeLock：保活三件套第 2 条
+        if (wakeLock == null) {
+            PowerManager pm = (PowerManager) getSystemService(POWER_SERVICE);
+            wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "dsh:container");
+            wakeLock.setReferenceCounted(false);
+        }
+        if (!wakeLock.isHeld()) wakeLock.acquire();
+
+        if (runner == null || !runner.isAlive()) {
+            runner = new Thread(this::bootContainer, "dsh-boot");
+            runner.start();
+        }
+        // 用户点开 APP 就启动，被杀后由系统按 START_STICKY 尝试恢复
+        return START_STICKY;
+    }
+
+    @Override
+    public void onDestroy() {
+        running = false;
+        if (proc != null) {
+            proc.destroy();
+            proc = null;
+        }
+        if (wakeLock != null && wakeLock.isHeld()) wakeLock.release();
+        super.onDestroy();
+    }
+
+    @Override
+    public IBinder onBind(Intent intent) { return null; }
+
+    // ------------------------------------------------------------------
+
+    private void bootContainer() {
+        try {
+            Cfg.log(this, "=== bootContainer 开始 ===");
+
+            // ★ 诊断：只跑一次（没有 diag.log 时）。
+            //   目的：在**真正的 app 进程（untrusted_app 域）**里测各路径能否 exec、
+            //   共享存储能不能读写。shell 里的 run-as 是 runas_app 域，结果是假阴性。
+            if (!new File(Cfg.files(this), "diag.log").exists()) {
+                Cfg.log(this, "跑一次能力诊断…");
+                Diag.runAll(this);
+            }
+
+            setStatus("准备 sysdata…");
+            Sysdata.ensure(this);
+            Cfg.log(this, "sysdata OK");
+
+            setStatus("部署 proot…");
+            ProotLauncher.stageBinaries(this);
+            Cfg.log(this, "proot 五件套 OK");
+
+            File tmp = Cfg.tmpDir(this);
+            if (!tmp.exists() && !tmp.mkdirs()) throw new IOException("无法创建 tmp");
+            File home = Cfg.dshHome(this);
+            if (!home.exists() && !home.mkdirs()) throw new IOException("无法创建 dshhome");
+
+            Cfg.log(this, "isInstalled=" + RootfsInstaller.isInstalled(this));
+            if (!RootfsInstaller.isInstalled(this)) {
+                setStatus("首次启动，正在解压运行环境（约 1~3 分钟）…");
+                Cfg.log(this, "开始解压 rootfs");
+                RootfsInstaller.install(this, (pct, detail) ->
+                        updateNotification("解压运行环境 " + pct + "%", detail));
+            }
+
+            // ★ pnpm：插件系统必需（没它插件市场会报 spawn pnpm ENOENT）
+            if (!RootfsInstaller.isPnpmInstalled(this)) {
+                setStatus("安装 pnpm（插件系统必需）…");
+                Cfg.log(this, "开始安装 pnpm");
+                RootfsInstaller.installPnpm(this, (pct, detail) ->
+                        updateNotification("安装 pnpm " + pct + "%", detail));
+            } else {
+                Cfg.log(this, "pnpm 已就位，跳过");
+            }
+
+            // ★★★ 移动端适配插件：随包分发，不能让用户自己去下载。
+            //   ★ 必须**在容器启动前**装好 —— profile 是启动时读的，
+            //     启动后再改要重启内核才生效。
+            if (!RootfsInstaller.isAdaptInstalled(this)) {
+                setStatus("安装移动端适配插件…");
+                Cfg.log(this, "开始安装 dsh-mobile-adaption");
+                RootfsInstaller.installAdapt(this, (pct, detail) ->
+                        updateNotification("安装移动端适配 " + pct + "%", detail));
+            } else {
+                Cfg.log(this, "移动端适配插件已就位，跳过");
+            }
+
+            setStatus("启动容器…");
+            java.util.List<String> cmd = ProotLauncher.buildCommand(this);
+            Cfg.log(this, "cmd = " + String.join(" ", cmd));
+
+            ProcessBuilder pb = new ProcessBuilder(cmd);
+            pb.redirectErrorStream(true);
+            ProotLauncher.applyEnv(pb, this);
+
+            FileOutputStream log = new FileOutputStream(Cfg.prootLog(this), false);
+            proc = pb.start();
+
+            // ★★★ 2026-10-19：从 **app 进程内部**自证共享存储是否真的可用。
+            //
+            // 为什么必须在这里做：`/storage/emulated/0` 受 FUSE 按 uid 隔离，
+            // `adb shell run-as` 的 uid 不是 app 的 uid ⇒ 一定 Permission denied。
+            // 那些 shell 测试结果全是假阴性，不能当判据。
+            //
+            // 这里直接检查 app 自己的 Files 接口，结果写进 boot.log，一目了然。
+            {
+                File phone = Cfg.phoneStorage(this);
+                File shared = Cfg.sharedRoot(this);
+                Cfg.log(this, "共享存储自检: /storage/emulated/0 exists="
+                        + phone.isDirectory()
+                        + " canRead=" + phone.canRead()
+                        + " canList=" + (phone.list() != null ? phone.list().length + "项" : "null"));
+                Cfg.log(this, "共享目录自检: " + shared.getAbsolutePath()
+                        + " exists=" + shared.isDirectory()
+                        + " canWrite=" + shared.canWrite());
+                try {
+                    File probe = new File(shared, "_probe_" + System.currentTimeMillis() + ".txt");
+                    boolean ok = probe.createNewFile();
+                    Cfg.log(this, "共享目录写入探测: " + ok);
+                    if (ok) {
+                        //noinspection ResultOfMethodCallIgnored
+                        probe.delete();
+                    }
+                } catch (Exception pe) {
+                    Cfg.log(this, "共享目录写入探测失败: " + pe);
+                }
+
+                // ★★★ 端到端验证：「容器里到底能不能读到手机文件」。
+                //
+                // 前面所有在 `adb shell run-as` 里做的测试都是**假阴性**
+                // （FUSE 按 uid 隔离，run-as 的 uid 不是 app 的 uid）。
+                // 唯一可信的做法：在 app 进程里、用 app 的 uid，去**列一遍容器内 /mnt/phone**。
+                // 这块逻辑放在容器起来之后（见下面 verifyPhoneMountFromContainer）。
+            }
+
+            // 把容器输出写进 proot.log，同时盯 token 出现
+            final Process p = proc;
+            Thread logThread = new Thread(() -> {
+                // ★★★ 2026-10-20：**同时镜像到 /sdcard/DeepseekHarness/proot.log**。
+                //   理由同 Cfg.log：release 版不能 run-as，files/proot.log 读不到 ⇒
+                //   容器起不来时完全没有诊断信息（这次就卡在这，只看到「容器已退出」）。
+                File extLog = new File(Cfg.sharedRoot(this), "proot.log");
+                try {
+                    //noinspection ResultOfMethodCallIgnored
+                    extLog.delete();
+                } catch (Exception ignored) {
+                }
+                try (BufferedReader r = new BufferedReader(
+                        new InputStreamReader(p.getInputStream(), StandardCharsets.UTF_8))) {
+                    String line;
+                    while ((line = r.readLine()) != null) {
+                        log.write((line + "\n").getBytes(StandardCharsets.UTF_8));
+                        log.flush();
+                        try (FileOutputStream ext =
+                                     new FileOutputStream(extLog, true)) {
+                            ext.write((line + "\n").getBytes(StandardCharsets.UTF_8));
+                        } catch (Exception ignored) {
+                        }
+                        if (line.contains("dsh web:")) {
+                            running = true;
+                            setStatus("已就绪");
+                            updateNotification("服务已就绪", "http://127.0.0.1:" + Cfg.PORT);
+                        }
+                    }
+                } catch (IOException e) {
+                    Log.w(TAG, "读容器输出结束: " + e.getMessage());
+                }
+            }, "dsh-log");
+            logThread.setDaemon(true);
+            logThread.start();
+
+            // 等服务就绪（最多 180 秒：冷启动实测 48~90 秒）
+            boolean ok = false;
+            for (int i = 0; i < 90; i++) {
+                if (probe()) { ok = true; break; }
+                if (!proc.isAlive()) break;
+                Thread.sleep(2000);
+            }
+
+            if (ok) {
+                // ★★★ 容器就绪后，立刻做一次**容器内**的手机存储读取验证。
+                //   这是唯一可信的判据：app 进程 + app uid + 真的进容器里去 ls。
+                //   前面用 run-as 测的全是假阴性（FUSE 按 uid 隔离）。
+                verifyPhoneMountFromContainer();
+
+                // ★★★ token 必须从 proot.log 里现读，不能用写死的常量。
+                //   踩过：Cfg.TOKEN 里那条是 Termux 时代的旧令牌，而 DSH 每次启动
+                //   都会生成新 token ⇒ WebView 加载后显示 "dsh web authentication required"。
+                String token = readTokenFromLog();
+                if (token != null) {
+                    readyUrl = "http://127.0.0.1:" + Cfg.PORT + "/?token=" + token;
+                    Cfg.log(this, "就绪，token 已取到");
+                } else {
+                    readyUrl = "http://127.0.0.1:" + Cfg.PORT + "/?token=" + Cfg.TOKEN;
+                    Cfg.log(this, "⚠️ 没从日志里读到 token，回退到常量");
+                }
+                running = true;
+                setStatus("已就绪");
+                updateNotification("服务已就绪", "http://127.0.0.1:" + Cfg.PORT);
+            } else {
+                setStatus("启动失败，见 proot.log");
+                updateNotification("启动失败", "详见 proot.log");
+            }
+
+            // 进程若退出，服务也跟着停（由用户重新点开）
+            proc.waitFor();
+            running = false;
+            setStatus("容器已退出");
+            stopSelf();
+
+        } catch (Exception e) {
+            Log.e(TAG, "启动失败", e);
+            Cfg.log(this, "!!! 启动失败: " + e);
+            java.io.StringWriter sw = new java.io.StringWriter();
+            e.printStackTrace(new java.io.PrintWriter(sw));
+            Cfg.log(this, sw.toString());
+            setStatus("启动失败：" + e.getMessage());
+            updateNotification("启动失败", String.valueOf(e.getMessage()));
+        }
+    }
+
+    /**
+     * ★★★ 端到端验证「容器内能不能读到手机文件」。
+     *
+     * 为什么必须在 app 进程里跑：`/storage/emulated/0` 受 FUSE 按 uid 隔离，
+     * `adb shell run-as` 的 uid 不是 app 的 uid ⇒ 那些测试一定是 Permission denied，
+     * 全是假阴性（这一轮为此浪费了好几轮）。
+     *
+     * 做法：用同一套 proot 参数（但只跑 `ls`，不启动 DSH），
+     * 在 app 进程里 fork 出来，把结果写进 boot.log。
+     */
+    private void verifyPhoneMountFromContainer() {
+        try {
+            File phone = Cfg.phoneStorage(this);
+            if (phone == null || !phone.isDirectory()) {
+                Cfg.log(this, "[容器内验证] 跳过：手机存储不可用");
+                return;
+            }
+
+            java.util.List<String> cmd = new java.util.ArrayList<>();
+            cmd.add(ProotLauncher.prootPath(this));
+            cmd.add("--link2symlink");
+            cmd.add("--rootfs=" + Cfg.prootPathOf(Cfg.rootfs(this)));
+            cmd.add("--cwd=/root");
+            cmd.add("--bind=/dev");
+            cmd.add("--bind=/proc");
+            cmd.add("--bind=/sys");
+            cmd.add("--bind=" + phone.getAbsolutePath() + ":" + Cfg.IN_PHONE);
+            cmd.add("/bin/sh");
+            cmd.add("-c");
+            cmd.add("echo CONTAINER_LS_BEGIN; "
+                    + "ls " + Cfg.IN_PHONE + " 2>&1 | head -20; "
+                    + "echo ---WRITE---; "
+                    // ★ 关键：验证容器内能不能**写**手机目录
+                    + "D=" + Cfg.IN_PHONE + "/DeepseekHarness; mkdir -p $D 2>&1; "
+                    + "echo 'container-write-'$(date +%s) > $D/_from_container.txt 2>&1 "
+                    + "&& cat $D/_from_container.txt || echo WRITE_FAILED; "
+                    + "echo CONTAINER_LS_END");
+
+            ProcessBuilder pb = new ProcessBuilder(cmd);
+            pb.redirectErrorStream(true);
+            ProotLauncher.applyEnv(pb, this);
+
+            Process p = pb.start();
+            StringBuilder sb = new StringBuilder();
+            try (BufferedReader r = new BufferedReader(
+                    new InputStreamReader(p.getInputStream(), StandardCharsets.UTF_8))) {
+                String line;
+                while ((line = r.readLine()) != null) sb.append(line).append(" | ");
+            }
+            p.waitFor();
+
+            Cfg.log(this, "[容器内验证] " + sb);
+        } catch (Exception e) {
+            Cfg.log(this, "[容器内验证] 失败: " + e);
+        }
+    }
+
+    /** HTTP 探活：401 = 服务起来了（未认证被正确拒绝）。 */
+    private boolean probe() {
+        HttpURLConnection conn = null;
+        try {
+            conn = (HttpURLConnection) new URL("http://127.0.0.1:" + Cfg.PORT + "/").openConnection();
+            conn.setConnectTimeout(2000);
+            conn.setReadTimeout(2000);
+            int code = conn.getResponseCode();
+            return code == 401 || code == 200 || code == 303;
+        } catch (Exception e) {
+            return false;
+        } finally {
+            if (conn != null) conn.disconnect();
+        }
+    }
+
+    /**
+     * 从 files/proot.log 里读本次启动生成的 token。
+     * 日志形如：`dsh web: http://127.0.0.1:3080/?token=XXXX`
+     * ★ 必须现读，不能写死 —— 每次启动 token 都会变。
+     */
+    private String readTokenFromLog() {
+        File log = Cfg.prootLog(this);
+        if (!log.exists()) return null;
+        try (BufferedReader r = new BufferedReader(new java.io.FileReader(log))) {
+            String line;
+            java.util.regex.Pattern p =
+                    java.util.regex.Pattern.compile("127\\.0\\.0\\.1:" + Cfg.PORT + "/\\?token=([A-Za-z0-9_-]+)");
+            while ((line = r.readLine()) != null) {
+                java.util.regex.Matcher m = p.matcher(line);
+                if (m.find()) return m.group(1);
+            }
+        } catch (Exception e) {
+            Cfg.log(this, "读 token 失败: " + e.getMessage());
+        }
+        return null;
+    }
+
+    private void setStatus(String s) {
+        lastStatus = s;
+        Log.i(TAG, s);
+    }
+
+    // ---------------------- 通知 ----------------------
+
+    private void createChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            NotificationChannel ch = new NotificationChannel(
+                    CH_ID,
+                    getString(R.string.notif_channel_name),
+                    NotificationManager.IMPORTANCE_LOW);
+            ch.setDescription(getString(R.string.notif_channel_desc));
+            ch.setShowBadge(false);
+            nm.createNotificationChannel(ch);
+        }
+    }
+
+    private Notification buildNotification(String text) {
+        return buildNotification(getString(R.string.notif_title), text);
+    }
+
+    private Notification buildNotification(String title, String text) {
+        Intent open = new Intent(this, MainActivity.class);
+        open.setFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP);
+        PendingIntent pi = PendingIntent.getActivity(this, 0, open,
+                PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+
+        return new NotificationCompat.Builder(this, CH_ID)
+                .setSmallIcon(android.R.drawable.stat_notify_sync)
+                .setContentTitle(title)
+                .setContentText(text)
+                .setOngoing(true)
+                .setContentIntent(pi)
+                .setPriority(NotificationCompat.PRIORITY_LOW)
+                .build();
+    }
+
+    private void updateNotification(String text) {
+        updateNotification(getString(R.string.notif_title), text);
+    }
+
+    private void updateNotification(String title, String text) {
+        nm.notify(CH_NOTIFY_ID, buildNotification(title, text));
+    }
+}

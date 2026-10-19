@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- ★ 2026-10-20 用户要求：「鲸鱼黑色背景白色」→ 说明反了，改成 **白底 + 黑鲸鱼**。
+         白底才能让黑鲸鱼的眼睛/肚子挖空看得清楚（黑底白鲸也是同样的形状，
+         但用户明确要白底）。
+         ★ 鲸鱼色沿用启动页 ic_whale.xml 的 #FF1A1A1A，两处一致。 -->
+    <color name="ic_launcher_background">#FFFFFFFF</color>
+</resources>
