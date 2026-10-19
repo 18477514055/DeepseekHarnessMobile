@@ -1,0 +1,82 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- ★ 2026-10-20：启动页改为**浅色**（用户：「启动页面改浅色的吧，深色的不好看」）。
+     配色对齐官方 web 前端的浅色主题：
+       背景 #FFFFFF / 主文字 #1A1A1A / 次要 #6B7280 / 进度条用官方品牌蓝 #4D6BFE
+     ★ 鲸鱼图标用官方 favicon 的矢量路径（ic_whale.xml），黑色填充在浅底上清晰。 -->
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:background="#FFFFFFFF"
+    android:fitsSystemWindows="true">
+
+    <!-- 启动 / 解压进度页 -->
+    <LinearLayout
+        android:id="@+id/splash"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:orientation="vertical"
+        android:gravity="center"
+        android:padding="32dp">
+
+        <!-- 官方鲸鱼图标 -->
+        <ImageView
+            android:layout_width="112dp"
+            android:layout_height="112dp"
+            android:src="@drawable/ic_whale"
+            android:contentDescription="@string/app_name" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="20dp"
+            android:text="@string/app_name"
+            android:textColor="#FF1A1A1A"
+            android:textSize="21sp"
+            android:textStyle="bold"
+            android:letterSpacing="0.01" />
+
+        <TextView
+            android:id="@+id/statusText"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="26dp"
+            android:text="准备中…"
+            android:gravity="center"
+            android:textColor="#FF6B7280"
+            android:textSize="14sp" />
+
+        <ProgressBar
+            android:id="@+id/progress"
+            style="?android:attr/progressBarStyleHorizontal"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:max="100"
+            android:progress="0"
+            android:progressTint="#FF4D6BFE"
+            android:progressBackgroundTint="#FFE5E7EB" />
+
+        <TextView
+            android:id="@+id/detailText"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="10dp"
+            android:gravity="center"
+            android:textColor="#FF9CA3AF"
+            android:textSize="12sp" />
+    </LinearLayout>
+
+    <!-- 主界面：WebView -->
+    <FrameLayout
+        android:id="@+id/webWrap"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:visibility="gone">
+
+        <WebView
+            android:id="@+id/webView"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent" />
+    </FrameLayout>
+</LinearLayout>

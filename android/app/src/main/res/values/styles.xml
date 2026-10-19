@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- ★ 2026-10-20：启动页改浅色后，窗口底色/状态栏/导航栏必须一起改浅 ——
+     否则 App 冷启动那一瞬会先闪一块深色（windowBackground 在 setContentView 之前就画出来了），
+     然后才变成浅色，比原来更难看。
+     ★ windowLightStatusBar 也必须有：白底 + 白色状态栏图标 = 看不见。 -->
+<resources>
+    <style name="Theme.DshMobile" parent="Theme.AppCompat.NoActionBar">
+        <item name="android:statusBarColor">#FFFFFFFF</item>
+        <item name="android:navigationBarColor">#FFFFFFFF</item>
+        <item name="android:windowBackground">#FFFFFFFF</item>
+        <item name="android:windowLightStatusBar">true</item>
+    </style>
+</resources>

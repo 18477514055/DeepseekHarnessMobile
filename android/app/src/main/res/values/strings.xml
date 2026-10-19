@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Deepseek Harness Mobile</string>
+    <string name="notif_channel_name">DSH 服务</string>
+    <string name="notif_channel_desc">保持本地容器运行</string>
+    <string name="notif_title">Deepseek Harness Mobile</string>
+    <string name="notif_text_idle">正在启动…</string>
+</resources>
