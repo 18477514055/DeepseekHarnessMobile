@@ -202,8 +202,43 @@ final class ProotLauncher {
         // ---- 容器内命令 ----
         cmd.add("/bin/sh");
         cmd.add("-c");
-        cmd.add("export PATH=" + Cfg.IN_NODE_DIR + ":$PATH; "
+        /* ★★★ 2026-10-20（P1 性能 · 拆那 43 秒）：
+         *   实测「启动容器」占 43~46 秒、占总启动的 95%，但它内部是**黑的** ——
+         *   proot 装配？node 冷启动？DSH 加载模块？还是 web server 初始化？
+         *   ⇒ 在容器内埋时间戳，让每个节点自己报。
+         *
+         *   ★ 判据指标：`T+xxx ms` 前缀，Java 侧用正则捞，进 boot.log 的 [阶段] 行。
+         *   ★ 用 /proc/uptime？不行 —— 容器里那是伪造的 sysdata。
+         *     用 `date +%s%N`（容器内有 date，前面探针就在用）。
+         *   ★ 全部走 stderr？不行，会污染 proot.log 的 token 解析。
+         *     统一 echo 到 stdout，读取线程本来就会落 proot.log，
+         *     而 token 正则是按 `127.0.0.1:3080/?token=` 匹配的，不会被这些行干扰。 */
+        cmd.add("T0=$(date +%s%N); "
+                + "mark(){ echo \"T+$(( ($(date +%s%N) - T0) / 1000000 ))ms $1\"; }; "
+                + "mark 'shell 已进容器'; "
+                + "export PATH=" + Cfg.IN_NODE_DIR + ":$PATH; "
+                + "mark 'PATH 已导出'; "
                 + "cd /root; "
+                + "mark '已切到 /root'; "
+                + "NODE_BIN=$(command -v node); "
+                + "mark \"找到 node: $NODE_BIN\"; "
+                /* ★★★ 2026-10-20（P1 性能 · 查那 29 秒）：
+                   实测 proot 装配只 3ms、node exec 只 4ms，
+                   剩下 ≈29.4 秒全在 **DSH 加载模块 + 建 server**。这一段本来是黑的。
+
+                   怎么量：挂一个诊断 preload（`_diag-preload.js`），它做两件事 ——
+                     ① **心跳**每 2 秒一次：有心跳说明在等异步（IO/网络），
+                        全程没心跳直到最后说明**同步阻塞**（CPU/模块加载）；
+                     ② 包 `Module._load` 记**每个 require 的耗时**，>150ms 的当场点名。
+                   ⇒ 这样"在等"还是"在算"、算在谁身上，一次就能分开。
+
+                   ★ 脚本从**共享目录**取（/sdcard 已绑定到 /sdcard/DeepseekHarness）：
+                     不进 APK 资产、不改包体、随时可替换。
+                   ★ 没有这个文件就**照常启动** —— 诊断绝不能变成启动的前提。 */
+                + "if [ -f /sdcard/_diag-preload.js ]; then "
+                + "  cp /sdcard/_diag-preload.js /tmp/__diag.js 2>/dev/null && "
+                + "  export NODE_OPTIONS='--require /tmp/__diag.js' && mark '已挂诊断 preload'; "
+                + "else mark '无诊断脚本，正常启动'; fi; "
                 + "exec node " + Cfg.IN_BIN_JS
                 + " web --no-open --host 127.0.0.1 --port " + Cfg.PORT);
 

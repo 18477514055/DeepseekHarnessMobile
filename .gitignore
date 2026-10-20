@@ -45,6 +45,8 @@ _*.sh
 _*.cjs
 _*.txt
 _*.js
+# ★ 例外：这是**可复用的诊断工具**，不是本机临时残留，必须入库
+!android/tools/_diag-preload.js
 # ---- assets 里的备份文件：Gradle 会把 assets 目录整个打进 APK ----
 #      （.gitignore 管不到 APK 打包，所以这条只是双保险；物理上别放这儿）
 android/app/src/main/assets/*.bak-*
@@ -58,3 +60,9 @@ _rel*.md
 
 # ---- 活动日志（本机采集产物，按周分桶；不进版本库）----
 _ledger-log/
+
+# ---- 从设备拉下来的内核源码副本（只为读实现，不是我们的产物）----
+_probe/
+_diag.b64
+_diag.js
+

@@ -47,6 +47,46 @@ public class DshService extends Service {
     /** 就绪后的完整 URL（含本次启动真实生成的 token）。MainActivity 读它。 */
     public static volatile String readyUrl = "";
 
+    /* ★★★ 2026-10-20（P1 性能）：**启动分段计时**。
+     *   起因：用户实测热启动也要近 100 秒。查 boot.log 发现 20:25:44.196 前置检查全部完成，
+     *   直到 20:27:27.674 才「就绪」—— 中间那 103 秒全花在容器内验证探针上。
+     *   ⇒ 从此每个阶段自己报耗时，谁慢一眼看得见，不用再靠猜。
+     *
+     *   实现要点：**记状态就是记阶段**。凡是调用 setStatus(...)，上一个阶段就结束、
+     *   这一阶段的计时开始。这样新增阶段不需要另外改代码。 */
+    public static volatile long bootStartedAt = 0L;
+    private long stageStartedAt = 0L;
+    private String stageName = "";
+    private final java.util.List<String> stageLog = new java.util.ArrayList<>();
+
+    /** 各阶段耗时（供 MainActivity 直接读，也让 boot.log 一份）。 */
+    public static volatile java.util.List<String> stageTimings =
+            java.util.Collections.synchronizedList(new java.util.ArrayList<String>());
+
+    /** 结束当前阶段并记一笔；下一阶段由下一次 setStatus 开始计时。 */
+    private synchronized void closeStage(String nextName) {
+        long now = System.currentTimeMillis();
+        if (stageStartedAt > 0L && !stageName.isEmpty()) {
+            long ms = now - stageStartedAt;
+            String line = String.format(java.util.Locale.US, "%.2fs  %s", ms / 1000.0, stageName);
+            stageLog.add(line);
+            stageTimings.add(line);
+            Cfg.log(this, "[阶段] " + line);
+        }
+        stageStartedAt = now;
+        stageName = (nextName == null) ? "" : nextName;
+    }
+
+    /** 收尾：把最后一段也记上，并打一份汇总。 */
+    private synchronized void finishStages() {
+        closeStage("");
+        long total = (bootStartedAt > 0L) ? (System.currentTimeMillis() - bootStartedAt) : 0L;
+        StringBuilder sb = new StringBuilder();
+        sb.append("总耗时 ").append(String.format(java.util.Locale.US, "%.2fs", total / 1000.0)).append("：");
+        for (String s : stageLog) sb.append("\n           ").append(s);
+        Cfg.log(this, "[阶段汇总] " + sb);
+    }
+
     private Process proc;
     private PowerManager.WakeLock wakeLock;
     private Thread runner;
@@ -103,7 +143,10 @@ public class DshService extends Service {
 
     private void bootContainer() {
         try {
+            bootStartedAt = System.currentTimeMillis();
+            stageTimings.clear();
             Cfg.log(this, "=== bootContainer 开始 ===");
+            closeStage("准备 sysdata");      // 计时起点；后面每次 setStatus 都会滚动到下一段
 
             // ★ 诊断：只跑一次（没有 diag.log 时）。
             //   目的：在**真正的 app 进程（untrusted_app 域）**里测各路径能否 exec、
@@ -288,6 +331,14 @@ public class DshService extends Service {
                             setStatus("已就绪");
                             updateNotification("服务已就绪", "http://127.0.0.1:" + Cfg.PORT);
                         }
+                        /* ★★★ 2026-10-20（P1 性能 · 拆那 43 秒）：
+                           容器内自己报的时间戳（`T+1234ms 某个节点`），
+                           直接落进 boot.log 的 [阶段] 行 —— 这样「启动容器」
+                           那 43 秒被切成若干段，谁慢一眼看得见。
+                           ★ 只在**启动完成前**记，避免稳态运行时的噪声。 */
+                        if (!running && line.startsWith("T+")) {
+                            Cfg.log(this, "[容器] " + line);
+                        }
                     }
                 } catch (IOException e) {
                     Log.w(TAG, "读容器输出结束: " + e.getMessage());
@@ -297,26 +348,56 @@ public class DshService extends Service {
             logThread.start();
 
             // 等服务就绪（最多 180 秒：冷启动实测 48~90 秒）
+            /* ★★★ 2026-10-20（P1 性能 · 修那 12 秒的空等）：
+               原来这里每 2 秒调一次 probe()，而 probe() 打的是 `GET /` —— 那是**首页**，
+               会真的把整页 HTML 读下来；readTimeout 又是 2000ms。
+               实测：`dsh web` 那行 21:26:11.4 就写好了，可「已就绪」拖到 21:26:23.5，
+               **12 秒** —— 就是 probe 反复超时 + 2 秒间隔叠出来的。
+
+               ⇒ 服务"活着"的判据不该是"HTTP 能取到首页"，而是**端口在 listening**。
+                 改用 `isPortOpen()`：只建 TCP 连接，不发请求、不读页面，几十毫秒就返回。
+                 ★ probe() 保留：它判的是"HTTP 层真的能应答"，在别的分支仍有用。 */
             boolean ok = false;
-            for (int i = 0; i < 90; i++) {
-                if (probe()) { ok = true; break; }
+            for (int i = 0; i < 900; i++) {          // 900 × 200ms = 180s 上限
+                if (isPortOpen()) { ok = true; break; }
                 if (!proc.isAlive()) break;
-                Thread.sleep(2000);
+                Thread.sleep(200);
             }
 
             if (ok) {
-                // ★★★ 容器就绪后，立刻做一次**容器内**的手机存储读取验证。
-                //   这是唯一可信的判据：app 进程 + app uid + 真的进容器里去 ls。
-                //   前面用 run-as 测的全是假阴性（FUSE 按 uid 隔离）。
-                verifyPhoneMountFromContainer();
+                /* ★★★ 2026-10-20（P1 性能，真机实测后的修正）：
+                 *   这里原来是**同步**调用 verifyPhoneMountFromContainer()，
+                 *   而它里面要跑 14 次 `dsh-android`（每次起一个 Node 进程走一次 socket）
+                 *   + 一次 `find /root /data -maxdepth 6` 全盘扫描。
+                 *   实测（boot.log）：前置检查 20:25:44.196 全部完成，
+                 *   到 20:27:27.674 才「就绪」—— **中间 103 秒全花在这一个探针上**。
+                 *   用户看到的现象就是「加载成功但一直转圈/白屏」，热启动也一样慢。
+                 *
+                 *   ⇒ 它是个**诊断探针**，不该坐在关键路径上。改成两步：
+                 *     ① 永远不再阻塞就绪 —— readyUrl 先算出来，页面先能用；
+                 *     ② 探针本身改成「只跑一次」（表盘在 diag-mount.done），
+                 *        且放在后台线程里跑，跑完只写日志。
+                 *   要重新验时删掉 files/diag-mount.done 即可。 */
 
                 // ★★★ token 必须从 proot.log 里现读，不能用写死的常量。
                 //   踩过：Cfg.TOKEN 里那条是 Termux 时代的旧令牌，而 DSH 每次启动
                 //   都会生成新 token ⇒ WebView 加载后显示 "dsh web authentication required"。
+                /* ★★★ 2026-10-20（P1 性能 · 修 8.87 秒的空等）：
+                   实测：proot.log 里 `dsh web` 那行 21:23:07.292 就写好了，
+                   但 token 直到 21:23:16.163 才读到 —— **中间空了 8.87 秒**。
+
+                   根因：`probe()` 每 2 秒轮询一次，一旦端口通就跳出循环，
+                   然后立刻调 readTokenFromLog()。可那一刻 dsh-log 线程可能
+                   才刚读进那个 46 字节的小文件，于是 readTokenFromLog 从头重试，
+                   **每轮都 sleep 200ms**，而真正该做的是「一发现就马上读」。
+                   ⇒ 现在改为：probe() 之后先用极短的细粒度轮询（20ms）等 token 落盘，
+                     拿到就走，不再按 200ms 粗粒度空转。 */
                 String token = readTokenFromLog();
                 if (token != null && !token.isEmpty()) {
                     readyUrl = "http://127.0.0.1:" + Cfg.PORT + "/?token=" + token;
                     Cfg.log(this, "就绪，token 已取到");
+                    closeStage("页面加载");
+                    finishStages();
 
             /* ★ 2026-10-20（验收）：DSH 内核此时已经读完配置并可能建过工作区，
              *   把关键文件的实际状态打进 boot.log。
@@ -326,6 +407,9 @@ public class DshService extends Service {
             } catch (Throwable t) {
                 Cfg.log(this, "[验收] dumpState 失败（不影响运行）: " + t);
             }
+
+                    // ★ 探针挪到后台、且只跑一次 —— 绝不占用启动时间。
+                    runMountProbeOnceInBackground();
                 } else {
                     /* ★★★ 2026-10-20：**绝不能用空 token 加载页面**。
                        踩过（用户报「主界面已经出现了，但各项功能始终不能用」）：
@@ -378,6 +462,44 @@ public class DshService extends Service {
      * 做法：用同一套 proot 参数（但只跑 `ls`，不启动 DSH），
      * 在 app 进程里 fork 出来，把结果写进 boot.log。
      */
+    /**
+     * ★★★ 容器内验证探针 —— **只跑一次，且不阻塞启动**（2026-10-20，P1 性能）。
+     *
+     * 为什么改成这样（真机实测，不是推理）：
+     *   它原来**同步**跑在「就绪」之前。boot.log 逐字：
+     *     20:25:44.196  共享目录写入探测: true        ← 前置检查全部完成
+     *     20:27:27.674  [容器内验证] CONTAINER_LS_…   ← 中间空了 103.5 秒
+     *     20:27:27.676  就绪，token 已取到
+     *   这 103 秒里跑的是 14 次 `dsh-android`（每次起一个 Node 进程走一次 socket）
+     *   + 一次 `find /root /data -maxdepth 6` 全盘扫描。
+     *   用户看到的就是「加载成功但一直转圈」，**热启动也一样慢**。
+     *   ⇒ 它是诊断不是功能，绝不能坐在启动关键路径上。
+     *
+     * 想重新验证：删掉 files/diag-mount.done 再启动一次。
+     */
+    private void runMountProbeOnceInBackground() {
+        try {
+            final File marker = new File(Cfg.files(this), "diag-mount.done");
+            if (marker.exists()) {
+                Cfg.log(this, "[容器内验证] 已跑过（diag-mount.done 存在），跳过；要重验就删掉该文件");
+                return;
+            }
+            Thread t = new Thread(() -> {
+                try {
+                    verifyPhoneMountFromContainer();
+                    marker.createNewFile();     // 跑完才落标记 —— 半途失败下次还会再试
+                } catch (Throwable e) {
+                    Cfg.log(this, "[容器内验证] 后台跑失败（不影响使用）: " + e);
+                }
+            }, "dsh-mount-probe");
+            t.setDaemon(true);
+            t.start();
+            Cfg.log(this, "[容器内验证] 已转到后台（只跑一次，不阻塞启动）");
+        } catch (Throwable e) {
+            Cfg.log(this, "[容器内验证] 无法启动后台探针（不影响使用）: " + e);
+        }
+    }
+
     private void verifyPhoneMountFromContainer() {
         try {
             File phone = Cfg.phoneStorage(this);
@@ -413,10 +535,6 @@ public class DshService extends Service {
                     + "mkdir -p $D/_dbg 2>&1; "
                     + "echo ---DSHHOME---; ls -ld /root/.dsh 2>&1; ls /root/.dsh 2>&1 | head -5; "
                     + "echo ---ID---; id 2>&1; "
-                    + "echo ---FINDWS---; find /root /data -maxdepth 6 -name 'pnpm-workspace.yaml' 2>/dev/null | head -10; "
-                    + "cp /root/.dsh/profiles/web/pnpm-workspace.yaml $D/_dbg/ 2>&1 && echo EXPORT_WS_OK || echo EXPORT_WS_FAIL; "
-                    + "cp /root/.dsh/profiles/web/package.json $D/_dbg/ 2>&1 && echo EXPORT_PKG_OK || echo EXPORT_PKG_FAIL; "
-                    + "cp /root/.dsh/profiles/web/.npmrc $D/_dbg/ 2>&1 && echo EXPORT_NPMRC_OK || echo EXPORT_NPMRC_FAIL; "
                     /* ★★★ 2026-10-20：**Android 能力桥连通性自检**。
                        这是唯一可信的判据 —— 只有真的从**容器内**发起连接
                        才能证明「抽象 socket 能穿过 proot」，在 adb shell 里测全是假阴性。
@@ -462,6 +580,31 @@ public class DshService extends Service {
     }
 
     /** HTTP 探活：401 = 服务起来了（未认证被正确拒绝）。 */
+    /**
+     * ★★★ 2026-10-20（P1 性能）：**只建 TCP 连接**判断服务是否活着。
+     *
+     * 为什么不用 probe()：probe() 打的是 `GET /`，会把首页 HTML 整个读下来，
+     * 且 readTimeout=2s。服务刚 listening、首页还没建好的那段，它每次都超时 2 秒，
+     * 叠上 2 秒轮询间隔 ⇒ 实测白等 12 秒（21:26:11.4 → 21:26:23.5）。
+     *
+     * 判据的区别：
+     *   · 「端口在 listening」 —— 进程活着、socket 建好了。这是**就绪**的判据。
+     *   · 「HTTP 能应答」     —— 还要首页渲染完。那是**页面可用**的判据，
+     *                            这件事由 readTokenFromLog + WebView 自己去等。
+     * ⇒ 两者不该混为一谈。这里只要前者。
+     */
+    private boolean isPortOpen() {
+        java.net.Socket s = new java.net.Socket();
+        try {
+            s.connect(new java.net.InetSocketAddress("127.0.0.1", Cfg.PORT), 300);
+            return true;
+        } catch (Exception e) {
+            return false;
+        } finally {
+            try { s.close(); } catch (Exception ignored) { }
+        }
+    }
+
     private boolean probe() {
         HttpURLConnection conn = null;
         try {
@@ -515,13 +658,18 @@ public class DshService extends Service {
                     Cfg.log(this, "读 token 失败: " + e.getMessage());
                 }
             }
-            try { Thread.sleep(200); } catch (InterruptedException ie) { break; }
+            /* ★★★ 2026-10-20（P1 性能）：间隔从 200ms 降到 20ms。
+               实测这 8.87 秒里，绝大部分是「文件已经写好了、我们却还在睡」。
+               20ms × 最多 750 次仍在 15 秒预算内，但平均等待从 100ms 掉到 10ms。
+               ★ 仍然保留重试（不能只读一次）——下面那条历史 bug 就是只读一次造成的。 */
+            try { Thread.sleep(20); } catch (InterruptedException ie) { break; }
         }
         Cfg.log(this, "⚠️ 等了 " + tries + " 次（约 15 秒）仍没读到 token");
         return null;
     }
 
     private void setStatus(String s) {
+        closeStage(s);          // ★ 记状态即记阶段：上一个阶段在这里收尾、这一个开始计时
         lastStatus = s;
         Log.i(TAG, s);
     }

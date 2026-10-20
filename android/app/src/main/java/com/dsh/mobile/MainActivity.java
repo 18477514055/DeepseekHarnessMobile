@@ -96,6 +96,14 @@ public class MainActivity extends AppCompatActivity {
             public void onPageStarted(WebView v, String url, android.graphics.Bitmap fav) {
                 Cfg.log(MainActivity.this,
                         "PAGE_START url=" + url.replaceAll("token=[^&]+", "token=***"));
+                /* ★★★ 2026-10-20：**到这一刻才撤启动页**。
+                   为什么：原来是 showWeb 里先 splash.GONE 再 loadUrl，
+                   而 WebView 从 loadUrl 到真正发出请求要 8~9 秒（渲染进程冷启动），
+                   这段时间 splash 已消失、页面还没画 ⇒ 用户看到的就是「黑屏 7~8 秒」。
+                   实测（JZQ8H6U46PBY9PV8）：showWeb 21:56:51.087 → PAGE_START 21:56:59.965，
+                   中间 8.9 秒全黑，而页面本身只用了 0.77 秒。
+                   ⇒ 启动页必须压到「页面真的开始了」再收，宁可多留一会儿也不要露黑底。 */
+                revealWeb();
             }
 
             @Override
@@ -295,7 +303,30 @@ public class MainActivity extends AppCompatActivity {
                 showWeb(url);
             } else {
                 long el = (System.currentTimeMillis() - startedAt) / 1000;
-                detailText.setText("已等待 " + el + " 秒（首次启动需解压约 1~3 分钟）");
+                /* ★★★ 2026-10-20（P1 性能 / 用户原话）：
+                   「可以让这个软件的启动页本身自己就先区分开加载各种各样东西的阶段，
+                     用户自己也能看得见，我们也刚好可以用得上这个分段测试。」
+
+                   ⇒ 启动页现在把**已完成阶段的耗时**逐条列出来：
+                     用户看得见卡在哪一步；我们顺手就有了分段数据。
+                   ★ 数据来源是 DshService.stageTimings（每次 setStatus 自动记一段），
+                     不是另造一套 —— 显示的和日志里的是同一份。 */
+                java.util.List<String> stages =
+                        new java.util.ArrayList<>(DshService.stageTimings);
+                StringBuilder sb = new StringBuilder();
+                sb.append("已等待 ").append(el).append(" 秒");
+                if (!stages.isEmpty()) {
+                    sb.append("\n");
+                    // 只列最近 6 段，避免长启动把屏幕占满
+                    int from = Math.max(0, stages.size() - 6);
+                    for (int i = from; i < stages.size(); i++) {
+                        if (i > from) sb.append("\n");
+                        sb.append("· ").append(stages.get(i));
+                    }
+                } else {
+                    sb.append("\n（首次启动需解压约 1~3 分钟）");
+                }
+                detailText.setText(sb.toString());
                 pollStatus();
             }
         }, 1000);
@@ -315,13 +346,27 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
+    /* ★★★ 2026-10-20（修「7~8 秒黑屏」）：撤启动页的**唯一入口**。
+       谁调：
+         · onPageStarted —— 正常路径，页面真的开始加载了
+         · showWeb 里的 12 秒兜底 —— 万一 onPageStarted 不来（离线 / 端口错）
+       为什么要收口成一个方法：以前 splash.GONE 散在 showWeb 里，
+       撤得太早就是这次黑屏的根因。收成一个入口，以后只有"该撤的时候"才撤。
+       用 post 到主线程：onPageStarted 虽在主线程，但兜底调用点可能在别的时机。 */
+    private void revealWeb() {
+        ui.post(() -> {
+            if (splash != null && splash.getVisibility() != View.GONE) {
+                splash.setVisibility(View.GONE);
+                Cfg.log(this, "revealWeb 已撤启动页（t=" + System.currentTimeMillis() + "）");
+            }
+        });
+    }
+
     private void showWeb(String url) {
         if (webShown) return;
         webShown = true;
         progress.setIndeterminate(false);
         progress.setProgress(100);
-        splash.setVisibility(View.GONE);
-        webWrap.setVisibility(View.VISIBLE);
 
         Log.i(TAG, "loading " + url.replaceAll("token=[^&]+", "token=***"));
         /* ★★★ 2026-10-20：把**是否带 token / token 有多长**记进 boot.log。
@@ -330,7 +375,18 @@ public class MainActivity extends AppCompatActivity {
            不把长度记下来，就无法区分是"URL 真的没带"还是"日志被正则抹掉了"。 */
         Cfg.log(this, "showWeb urlLen=" + url.length()
                 + " hasToken=" + (url.contains("?token=") && !url.endsWith("?token=")));
+
+        /* ★★★ 2026-10-20（修「7~8 秒黑屏」）：
+           原顺序是 splash.GONE → webWrap.VISIBLE → loadUrl。
+           实测 WebView 从 loadUrl 到 onPageStarted 要 8~9 秒（渲染进程冷启动），
+           这段时间启动页已撤、页面没画 ⇒ 全黑。
+           ⇒ 现在：WebView 从布局加载起就在底层可见（不靠这里切），splash **不撤**，
+              由 onPageStarted / revealWeb() 负责撤；同时留一个 12 秒兜底，
+              万一 onPageStarted 不来（离线/端口错），也不能让启动页永远卡着。 */
         webView.loadUrl(url);
+
+        // ★ 兜底：12 秒还没等到 onPageStarted，就先撤（总比一直挡着强）
+        ui.postDelayed(this::revealWeb, 12000);
 
         // ★★★ 2026-10-20：**主动注入**一段诊断 —— 不依赖插件的 console.log
         //   （实测 web.log 根本没生成 ⇒ onConsoleMessage 或 console.log 没走通）。
