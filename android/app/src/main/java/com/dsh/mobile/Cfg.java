@@ -22,14 +22,19 @@ final class Cfg {
     private Cfg() {}
 
     /**
-     * 启动令牌：**正常路径下根本用不到**。
+     * 启动令牌常量 —— **已删除，不要加回来**。
      *
-     * ★ DSH 每次启动都会重新生成 token，所以真正取 token 的地方是
-     *   {@code DshService.readTokenFromLog()}（从 proot.log 里现读）。
-     *   这里的常量只是"万一读不到日志"的兜底，故意留空 ——
-     *   写死真令牌既没用（下次启动就变），又会在公开仓库里泄漏。
+     * ★ DSH 每次启动都会重新生成 token，唯一正确的来源是
+     *   {@code DshService.readTokenFromLog()}（从 files/proot.log 现读，带重试）。
+     *
+     * ★★★ 2026-10-20 教训（用户报「主界面已经出现了，但各项功能始终不能用」）：
+     *   这里原有一个写死的 TOKEN 常量，用作"读不到日志时的兜底"。
+     *   脱敏时它被改成空串，于是读不到 token 时就会回退到**空 token** ⇒
+     *   页面照样渲染出来（WebView 不报错），但所有 API 401
+     *   ⇒ 用户看到"界面在、功能全废"，还要等好几分钟才有变化。
+     *   ⇒ 兜底值本身是个陷阱：它让失败伪装成"能用"。
+     *     现在拿不到 token 就直接报错不加载页面（见 DshService）。
      */
-    static final String TOKEN = "";
 
     static final int PORT = 3080;
 

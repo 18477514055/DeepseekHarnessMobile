@@ -83,6 +83,25 @@ public class MainActivity extends AppCompatActivity {
                 } catch (Exception ignored) { }
                 return true;
             }
+
+            /* ★★★ 2026-10-20：记录**页面加载各阶段**的真实时间点。
+               为什么加：用户报「更新后首次打开，进去后几分钟主界面的功能都不能用」，
+               但外层 boot.log 只能看到容器起来那一刻，看不到**页面内部**在等什么
+               （内核初始化 profile / 加载插件 / 拉模型清单都发生在页面里）。
+               有了这三条，下次首次打开就能直接看出卡在哪个阶段：
+                 PAGE_START  → onPageStarted
+                 PAGE_DONE   → onPageFinished（DOM 好了，但功能不一定就绪）
+                 PAGE_PROGRESS → onProgressChanged 到达 100 */
+            @Override
+            public void onPageStarted(WebView v, String url, android.graphics.Bitmap fav) {
+                Cfg.log(MainActivity.this,
+                        "PAGE_START url=" + url.replaceAll("token=[^&]+", "token=***"));
+            }
+
+            @Override
+            public void onPageFinished(WebView v, String url) {
+                Cfg.log(MainActivity.this, "PAGE_DONE（DOM 就绪）");
+            }
         });
 
         // ★★★ 2026-10-20：把页面 console 转发到 /sdcard/DeepseekHarness/web.log。
@@ -92,6 +111,15 @@ public class MainActivity extends AppCompatActivity {
         //   手势每一步为什么被跳过（平台/滚动区/面板页/阈值不够…）。
         //   ★ 只记 `[DSH-DIAG]` 前缀的，避免把官方日志刷爆。
         webView.setWebChromeClient(new android.webkit.WebChromeClient() {
+            /* ★★★ 2026-10-20：记录页面加载进度，只记 10/50/100 三个点。
+               和 PAGE_START/PAGE_DONE 配合，能区分「DOM 到了」和「资源全到了」。 */
+            @Override
+            public void onProgressChanged(WebView v, int p) {
+                if (p == 10 || p == 50 || p == 100) {
+                    Cfg.log(MainActivity.this, "PAGE_PROGRESS " + p + "%");
+                }
+            }
+
             @Override
             public boolean onConsoleMessage(android.webkit.ConsoleMessage cm) {
                 try {
@@ -296,6 +324,12 @@ public class MainActivity extends AppCompatActivity {
         webWrap.setVisibility(View.VISIBLE);
 
         Log.i(TAG, "loading " + url.replaceAll("token=[^&]+", "token=***"));
+        /* ★★★ 2026-10-20：把**是否带 token / token 有多长**记进 boot.log。
+           为什么要记长度：真机日志里出现过「日志说 token 已取到，但 PAGE_START
+           的 URL 是 http://127.0.0.1:3080/（没有 ?token=）」的矛盾。
+           不把长度记下来，就无法区分是"URL 真的没带"还是"日志被正则抹掉了"。 */
+        Cfg.log(this, "showWeb urlLen=" + url.length()
+                + " hasToken=" + (url.contains("?token=") && !url.endsWith("?token=")));
         webView.loadUrl(url);
 
         // ★★★ 2026-10-20：**主动注入**一段诊断 —— 不依赖插件的 console.log

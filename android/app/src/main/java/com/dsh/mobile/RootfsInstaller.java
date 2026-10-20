@@ -4,11 +4,13 @@ import android.content.Context;
 import android.util.Log;
 
 import java.io.BufferedInputStream;
+import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -211,7 +213,7 @@ final class RootfsInstaller {
      * 而 APK 升级时插件源码可能已经换了 ⇒ 不重装就还是旧的。
      * 踩过：改完 bug 出了新包，装上却还是老行为，因为判定"已装好"直接跳过了。
      */
-    static final int ADAPT_BUILD = 15;
+    static final int ADAPT_BUILD = 17;
     static final String ADAPT_STAMP = ".adapt-build";
 
     static File adaptDir(Context c) { return new File(Cfg.rootfs(c), ADAPT_DIR); }
@@ -412,6 +414,11 @@ final class RootfsInstaller {
         //   ★ 它必须独立于 patchProfile：patchProfile 有"已含就跳过"的短路，
         //     而链接可能因为各种原因缺失（比如上一次 patchProfile 成功但建链接失败）。
         linkIntoNodeModules(c);
+
+        /* ⑦ pnpm 的「最小发布年龄」修正在**容器内**做，由
+         *   DshService.bootContainer() 无条件调用 fixPnpmWorkspaceBeforeBoot()。
+         *   ★ 不放这里的原因：installAdapt 只在"插件没装好"时才被调用，
+         *     插件已装好时整段跳过 ⇒ 补丁永远跑不到（踩过）。 */
 
         p.onProgress(100, "移动端插件已就位");
     }
@@ -833,6 +840,392 @@ final class RootfsInstaller {
         }
     }
 
+    /* ======================================================================
+     * ★★★ 2026-10-20：pnpm「最小发布年龄」限制的修复
+     *
+     * 用户报错原文：
+     *   Cannot edit "minimumReleaseAgeExclude" in
+     *   "/root/.dsh/profiles/web/pnpm-workspace.yaml": it uses an inline YAML
+     *   value that cannot be edited in place (a multi-line flow collection,
+     *   an alias, or a scalar). Reformat it to block style and try again.
+     *   → dsh: plugin command failed; pnpm add -w 'dsh-ledger-memory@1.2.9'
+     *
+     * 机理：pnpm 默认开启 minimumReleaseAge（新包要「放一阵」才允许安装）。
+     *   DSH 的插件管理器往 pnpm-workspace.yaml 写豁免名单时用**流式 YAML**
+     *   （`minimumReleaseAgeExclude: [x, y]`），而 pnpm 内部更新该字段只支持
+     *   **块式**（每项一行 `- x`）⇒ 报上面的错 ⇒ **所有插件都装不上**。
+     *
+     * 修法：**让它不产生这个字段**。
+     *   ① 在 pnpm-workspace.yaml 里写 `minimumReleaseAge: 0`（关闭该策略）；
+     *   ② 把已存在的 `minimumReleaseAgeExclude` 删掉（无论流式还是块式）；
+     *   ③ 若 yaml 里已有流式的该字段，重写成块式再删，
+     *      避免 pnpm 下次又因为"改不了"而报错。
+     *
+     * ★ 只动 pnpm-workspace.yaml 这一个文件，不碰 package.json。
+     * ★ 全流程 try/catch，任何异常都不影响容器启动。
+     * ====================================================================== */
+    private static final String PNPM_WS = "profiles/web/pnpm-workspace.yaml";
+
+    /* ======================================================================
+     * ★★★ 2026-10-20：在**容器内**修 pnpm-workspace.yaml
+     *
+     * 为什么必须进容器：
+     *   实测 `/root/.dsh` 在 Android 侧的权限是 `d---------`（000）——
+     *   App 进程（uid 10420）连 ls 都做不到，更别说读写了。
+     *   容器里 DSH 是以 root 跑的（root 可无视权限位），所以只有容器内能改。
+     *
+     * 做法：起一个**临时的 proot**（和主容器同一套 rootfs），
+     *   跑一段 sh 脚本，把文件规整成 pnpm 能接受、DSH 也不会再撞墙的形态。
+     *   ★ 这个临时 proot 很短命，跑完就退出，不影响随后启动的主容器。
+     *
+     * 修什么（用户报错）：
+     *   Cannot edit "minimumReleaseAgeExclude" in
+     *   "/root/.dsh/profiles/web/pnpm-workspace.yaml": it uses an inline YAML
+     *   value that cannot be edited in place …
+     *   → dsh: plugin command failed; pnpm add -w 'dsh-ledger-memory@1.2.9'
+     *
+     * 怎么修：
+     *   ① 删掉 minimumReleaseAgeExclude（流式/块式都删）；
+     *   ② 写 `minimumReleaseAge: 0` 关闭该策略 ⇒ pnpm 不再产生那个字段。
+     *
+     * ★ 用 printf 生成脚本再执行，避免多层引号被 shell 吃掉。
+     * ====================================================================== */
+    static void fixPnpmWorkspaceBeforeBoot(Context c) {
+        try {
+            File rootfs = Cfg.rootfs(c);
+
+            /* ★★★ 路径必须走 **Android 侧**的 Cfg.dshHome()，不能用 rootfs/root/.dsh。
+             *
+             * 踩过：我一开始按"容器里的 /root/.dsh"去 rootfs 下找
+             *   rootfs/root/.dsh/profiles/web/pnpm-workspace.yaml
+             * 结果日志是「pnpm-workspace.yaml 尚未生成，跳过」——
+             * 其实文件一直在，只是**真实位置**是：
+             *   files/dshhome/profiles/web/pnpm-workspace.yaml
+             * 因为 ProotLauncher 启动时做了 bind：
+             *   --bind=<files/dshhome>:/root/.dsh
+             * ⇒ 容器看到的 /root/.dsh 就是它，rootfs 里那个目录是空的。
+             *
+             * ★ 因此：
+             *   · 判断"文件在不在" → 用 Android 侧 Files API（Cfg.dshHome）；
+             *   · 真正的改写 → 仍要进容器（Android 侧权限是 000，root 才能写）。
+             *     容器内路径依旧是 /root/.dsh/...（bind 之后它就是那个文件）。 */
+            File wsAndroid = new File(Cfg.dshHome(c), PNPM_WS);
+            if (!wsAndroid.exists()) {
+                Cfg.log(c, "pnpm-workspace.yaml 尚未生成（DSH 还没初始化 profile），跳过 pnpm 限制修正");
+                return;
+            }
+            Cfg.log(c, "准备修 pnpm 限制，目标=" + wsAndroid.getAbsolutePath());
+
+            java.util.List<String> cmd = new java.util.ArrayList<>();
+            cmd.add(ProotLauncher.prootPath(c));
+            cmd.add("--link2symlink");
+            cmd.add("--rootfs=" + Cfg.prootPathOf(rootfs));
+            cmd.add("--cwd=/root");
+            cmd.add("--bind=/dev");
+            cmd.add("--bind=/proc");
+            /* ★★★ 关键：把真实家目录 bind 进容器。
+             * 这个临时 proot 是**独立新实例**，不像主容器那样自带 bind ——
+             * 不挂这一条，容器里 /root/.dsh 是 rootfs 里的空目录，
+             * 脚本会报 PNPM_WS_ABSENT（我第一版就是这么错的）。 */
+            cmd.add("--bind=" + Cfg.prootPathOf(Cfg.dshHome(c)) + ":/root/.dsh");
+            /* ★★★ 2026-10-20：**还必须把共享目录挂进来**。
+             *
+             * 踩过：这个临时 proot 是独立实例，不像主容器那样自带
+             *   --bind=<shared>:/sdcard
+             * 所以容器里 `/sdcard` 根本不存在，脚本里的
+             *   mkdir -p /sdcard/DeepseekHarness/_dbg
+             * 直接报 `mkdir: cannot create directory '/sdcard': Operation not permitted`
+             * （rootfs 根是只读的，建不了顶层目录）。
+             * ⇒ 导出/写回两个阶段都依赖 /sdcard，必须显式挂。 */
+            cmd.add("--bind=" + Cfg.prootPathOf(Cfg.sharedRoot(c)) + ":/sdcard");
+            cmd.add("/bin/sh");
+            cmd.add("-c");
+
+            /* 修正脚本（★ 2026-10-20 重写：上一版 sed 范围删除把整个文件删空了）
+             *
+             * 上一版错在哪：
+             *   sed -i '/^minimumReleaseAgeExclude:/,+20{...}' ——
+             *   "+20" 会从匹配行往后吃 20 行，而这个文件里 `packages:` 等配置
+             *   就在附近 ⇒ **整份文件被删成只剩 allowBuilds**，
+             *   用户的 pnpm 配置直接毁掉。
+             *
+             * 这一版的原则：**只做精确的整行删除，绝不按范围删**。
+             *   ① 删掉所有以 minimumReleaseAgeExclude 开头的行（流式单行）；
+             *   ② 删掉所有以 minimumReleaseAge: 开头的行（旧值）；
+             *   ③ 追加 minimumReleaseAge: 0；
+             *   ④ 改前先备份到 .bak，改完打印全文供核对。
+             *   ★ 流式多行（`[...` 换行 `]`）这种形态这里不尝试修补 ——
+             *     pnpm 一旦报那个错，说明它已经写进去了；我们删掉整行后
+             *     剩下的孤立 `]` 会在下一步用 awk 收尾时清掉。
+             */
+            /* ★★★ 2026-10-20 补救：如果上一次是**被旧版脚本改坏**的，先用 .bak 还原。
+             * 判据：文件里既没有 `packages:` 也没有 `nodeLinker:`（正常文件必有其一），
+             * 但存在 .bak ⇒ 说明上次删过头了，还原它再重新处理。
+             * ★ 这段必须在新脚本之前跑，否则会在坏文件上继续改。 */
+            String sh =
+                    "W=/root/.dsh/profiles/web/pnpm-workspace.yaml; "
+                  + "if [ ! -f $W ]; then echo PNPM_WS_ABSENT; exit 0; fi; "
+                  // 顺手把插件管理器最近一次的失败日志导出到共享目录，便于定位
+                  + "L=/root/.dsh/profiles/web/.plugin-manager/logs; "
+                  + "OUT=/sdcard/DeepseekHarness/_dbg; mkdir -p $OUT 2>/dev/null; "
+                  + "if [ -d $L ]; then "
+                  + "  for d in $(ls -1t $L 2>/dev/null | head -3); do "
+                  + "    cp $L/$d/*.log $OUT/plug-$d.log 2>/dev/null && echo EXPORTED:$d; "
+                  + "  done; "
+                  + "fi; "
+                  /* ★ 顺带清掉 rootfs 里可能残留的 npm 明文令牌（老设备已经解压过的那份）。 */
+                  + "N=/root/.npmrc; "
+                  + "if [ -f $N ] && grep -q 'authToken' $N 2>/dev/null; then "
+                  + "  grep -v 'authToken' $N > $N.new && mv $N.new $N && echo NPMRC_TOKEN_CLEARED; "
+                  + "fi; "
+                  + "if [ -f $W.bak ]; then "
+                  + "  if ! grep -qE '^(packages|nodeLinker):' $W && grep -qE '^(packages|nodeLinker):' $W.bak; then "
+                  + "    cp $W.bak $W && echo HEALED_FROM_BAK; "
+                  + "  fi; "
+                  + "fi; "
+                  + "cp $W $W.bak2 && echo BACKUP_OK || echo BACKUP_FAIL; "
+                  // ① ② 精确整行删除（不用范围删除！）
+                  + "grep -v '^[[:space:]]*minimumReleaseAgeExclude:' $W.bak "
+                  + "  | grep -v '^[[:space:]]*minimumReleaseAge:' "
+                  + "  > $W.tmp1; "
+                  // ③ 清掉可能残留的孤立流式括号行（只有在 exclude 被删后才可能出现）
+                  + "awk 'BEGIN{skip=0} "
+                  + "  /^[[:space:]]*\\][[:space:]]*$/{next} "
+                  + "  {print}' $W.tmp1 > $W.tmp2; "
+                  // ④ 追加设置
+                  + "cp $W.tmp2 $W; "
+                  + "printf '\\nminimumReleaseAge: 0\\n' >> $W; "
+                  + "rm -f $W.tmp1 $W.tmp2; "
+                  /* ★★★ 2026-10-20（关键修法）：把 **JSON 风格 YAML 转成块式 YAML**。
+                   *
+                   * 真根因（用户截图为证）：
+                   *   pnpm 报 "it uses an inline YAML value that cannot be edited
+                   *   in place (a multi-line flow collection, an alias, or a scalar)"。
+                   *   注意它说**包括 scalar** —— 也就是说我们补的 `minimumReleaseAge: 0`
+                   *   同样"不可原地编辑"。真正的原因是**整个文件是 JSON 风格**：
+                   *     {
+                   *       allowBuilds:
+                   *         { "@google/genai@1.52.0": true }
+                   *     }
+                   *   外层那一对大括号就是"flow collection"⇒ pnpm 的 YAML 结构化编辑器
+                   *   无法对它做原地修改 ⇒ 任何插件都装不上。
+                   *
+                   * 修法：去掉最外层 `{ }`，把内部缩进减 2 格，变成普通块式 YAML。
+                   *   · 只处理"**整个文件就是一个大括号块**"这一种形态（我们的目标场景）；
+                   *   · 若文件本来就不是 JSON 风格，这段什么都不做。
+                   *   · 改完仍走后面的自检，不合格自动还原。 */
+                  /* ★ 判据只看**第一行是不是 `{`** —— 具体是不是 JSON 风格
+                     交给 Java 侧的 jsonStyleToBlock() 去判断（它有大括号配平逻辑）。
+                     ★ 上一版这里还要求"最后一行是 }"，但我自己往末尾追加过
+                      minimumReleaseAge: 0 ⇒ 永远判不中（日志里一直是 IS_BLOCK_STYLE）。
+                     现在无条件把文件导出，让 Java 决定要不要转。 */
+                  /* ★★ 2026-10-20 改用 **rootfs 内的临时目录** 做中转，不走共享存储。
+                   *
+                   * 踩过：`cp` 到 /sdcard 虽返回 0（&& echo EXPORTED_FOR_JAVA 打出来了），
+                   * 但文件**根本没落盘** —— 共享存储是 FUSE，临时 proot 里写入不生效。
+                   * ⇒ 改成写到 rootfs/root/_wsxfer/（容器内真实可写、Android 侧也能读）。 */
+                  + "mkdir -p /root/_wsxfer; "
+                  + "cp $W /root/_wsxfer/ws-before.yaml "
+                  + "&& echo EXPORTED_FOR_JAVA || echo EXPORT_FAIL; "
+                  + "ls -la /root/_wsxfer/ 2>&1; "
+                  + "echo ---WS-BEFORE---; cat $W; echo ---WS-END---";
+
+            cmd.add(sh);
+
+            ProcessBuilder pb = new ProcessBuilder(cmd);
+            pb.redirectErrorStream(true);
+            ProotLauncher.applyEnv(pb, c);
+
+            Process p = pb.start();
+            StringBuilder sb = new StringBuilder();
+            try (BufferedReader r = new BufferedReader(
+                    new InputStreamReader(p.getInputStream(), StandardCharsets.UTF_8))) {
+                String line;
+                while ((line = r.readLine()) != null) {
+                    sb.append(line).append('\n');
+                    if (sb.length() > 4000) break;      // 防御：绝不刷爆日志
+                }
+            }
+            p.waitFor();
+            Cfg.log(c, "[pnpm 修正] " + sb.toString().replace("\n", " | "));
+
+            /* ★★★ 第二阶段：Java 侧做 JSON→块式 转换，再写回容器。
+             *
+             * 为什么不在 shell 里一次做完：把 JSON 风格 YAML 转成块式 YAML
+             * 涉及"按嵌套深度重算缩进"，写成多行 awk 既难读也难验证。
+             * Java 这边有同名方法的单测（PC 上 3 组用例全过），
+             * 而且失败能打日志。
+             *
+             * 流程：
+             *   ① 读 files/dshHome/.../pnpm-workspace.yaml（Android 侧可读）；
+             *   ② jsonStyleToBlock() 转换；
+             *   ③ 若确有变化 ⇒ 写到共享目录的临时文件；
+             *   ④ 容器内 cp 覆盖回去（容器里是 root，能写 000 权限的目录）。
+             */
+            try {
+                /* ★★ 读**共享目录里的副本**，不读 wsAndroid。
+                 *
+                 * 踩过：`wsAndroid.exists()` 在 Android 侧返回 false
+                 * （/root/.dsh 权限 000，App 进程 uid 读不到），
+                 * 于是整段转换被跳过 —— 日志里只有 WS-BEFORE，没有"已生成块式"。
+                 * 而阶段一已经让容器把文件 cp 到 /sdcard/_dbg/ws-before.yaml，
+                 * 那一份**一定可读**，就用它。 */
+                /* ★★ 2026-10-20：中转改走 **rootfs 内的目录**，不再用共享存储。
+                 * 踩过：写到 /sdcard 的 cp 返回成功、&& 也打印了，
+                 * 但文件在 FUSE 上根本不存在（临时 proot 里写共享存储不生效）。
+                 * rootfs/root/_wsxfer 是容器内真实可写、Android 侧也能直接读。 */
+                File exported = new File(rootfs, "root/_wsxfer/ws-before.yaml");
+                if (!exported.exists()) {
+                    Cfg.log(c, "⚠️ 没找到 " + exported.getAbsolutePath() + "，跳过 Java 转换");
+                    return;
+                }
+                String orig = new String(java.nio.file.Files.readAllBytes(exported.toPath()),
+                        StandardCharsets.UTF_8);
+                Cfg.log(c, "读到导出的 YAML，" + orig.length() + " 字符，开始判断形态");
+                String conv = jsonStyleToBlock(orig);
+                if (!conv.equals(orig)) {
+                    File staging = new File(rootfs, "root/_wsxfer/ws-new.yaml");
+                    //noinspection ResultOfMethodCallIgnored
+                    staging.getParentFile().mkdirs();
+                    writeText(staging, conv);
+                    Cfg.log(c, "已生成块式 YAML，准备写回容器（原 " + orig.length()
+                            + " 字符 → 新 " + conv.length() + " 字符）");
+
+                    // 容器内把它写回真实位置
+                    java.util.List<String> cmd2 = new java.util.ArrayList<>();
+                    cmd2.add(ProotLauncher.prootPath(c));
+                    cmd2.add("--link2symlink");
+                    cmd2.add("--rootfs=" + Cfg.prootPathOf(rootfs));
+                    cmd2.add("--cwd=/root");
+                    cmd2.add("--bind=/dev");
+                    cmd2.add("--bind=/proc");
+                    cmd2.add("--bind=" + Cfg.prootPathOf(Cfg.dshHome(c)) + ":/root/.dsh");
+                    /* ★ 不需要再挂共享目录 —— 中转文件就在 rootfs 内
+                     *   (root/_wsxfer/ws-new.yaml)，容器里天然可见。 */
+                    cmd2.add("/bin/sh");
+                    cmd2.add("-c");
+                    cmd2.add("cp /root/_wsxfer/ws-new.yaml /root/.dsh/profiles/web/pnpm-workspace.yaml "
+                           + "&& echo WRITTEN_BACK || echo WRITEBACK_FAIL; "
+                           + "rm -rf /root/_wsxfer; "
+                           + "echo ---WS-AFTER---; "
+                           + "cat /root/.dsh/profiles/web/pnpm-workspace.yaml; "
+                           + "echo ---WS-END---");
+
+                    ProcessBuilder pb2 = new ProcessBuilder(cmd2);
+                    pb2.redirectErrorStream(true);
+                    ProotLauncher.applyEnv(pb2, c);
+                    Process p2 = pb2.start();
+                    StringBuilder sb2 = new StringBuilder();
+                    try (BufferedReader r2 = new BufferedReader(
+                            new InputStreamReader(p2.getInputStream(), StandardCharsets.UTF_8))) {
+                        String line;
+                        while ((line = r2.readLine()) != null) {
+                            sb2.append(line).append(" | ");
+                            if (sb2.length() > 3000) break;
+                        }
+                    }
+                    p2.waitFor();
+                    Cfg.log(c, "[pnpm 写回] " + sb2);
+                } else {
+                    Cfg.log(c, "pnpm-workspace.yaml 已是块式，无需转换");
+                }
+            } catch (Throwable t2) {
+                Cfg.log(c, "⚠️ Java 侧转换/写回失败: " + t2);
+            }
+        } catch (Throwable t) {
+            Cfg.log(c, "⚠️ fixPnpmWorkspaceBeforeBoot 失败（不影响启动）: " + t);
+        }
+    }
+
+    /**
+     * 把 **JSON 风格的 YAML** 转成**块式 YAML**。
+     *
+     * ★★★ 2026-10-20：true 根因就在这个方法存在的原因里。
+     *
+     * 用户设备上的 `/root/.dsh/profiles/web/pnpm-workspace.yaml` 长这样：
+     * ```
+     * {
+     *   allowBuilds:
+     *     {
+     *       "@google/genai@1.52.0": true,
+     *       protobufjs@7.6.6: true
+     *     }
+     * }
+     * ```
+     * 整份文件被一对 `{ }` 包着（flow collection）。pnpm 的 YAML 结构化编辑器
+     * **无法对有 flow collection 的文件做原地修改**，于是报：
+     *   Cannot edit "minimumReleaseAgeExclude" … it uses an inline YAML value
+     *   that cannot be edited in place (a multi-line flow collection, an alias,
+     *   or a scalar).
+     *
+     * ★ 注意它连 **scalar** 都算 —— 所以我之前补的 `minimumReleaseAge: 0`
+     *   同样无效。**必须把整个文件变成块式**，这是唯一解法。
+     *
+     * 算法（不用"数大括号"的猜测，按嵌套深度重建缩进）：
+     *   · 只处理"整份文件被一对 { } 包住"的形态，其它原样返回（绝不乱改）；
+     *   · 跳过所有纯 `{` / `}` / `},` 标记行；
+     *   · 维护 depth：最外层 { 不计，内层 { +1，} -1；
+     *   · 每个键值行的缩进 = depth × 2 空格；
+     *   · 去掉行尾逗号（JSON 遗留）。
+     *
+     * ★ 已在 PC 上用 Node 复现同一算法跑过 3 组用例（真实形态 / 已是块式 / 块式带设置），
+     *   全部通过；「已是块式」必须**逐字不变**。
+     */
+    static String jsonStyleToBlock(String src) {
+        String[] lines = src.split("\n", -1);
+
+        // ① 找第一个非空行，必须是 `{`
+        int startIdx = -1;
+        for (int i = 0; i < lines.length; i++) {
+            if (!lines[i].trim().isEmpty()) { startIdx = i; break; }
+        }
+        if (startIdx < 0 || !"{".equals(lines[startIdx].trim())) return src;  // 不是 JSON 风格
+
+        /* ★★★ 2026-10-20：判据改成「**开头是 { 且大括号能配平**」，
+         *   不再要求"最后一行是 }"。
+         *
+         * 踩过：上一版要求最后一行必须是 `}`，但我自己往文件末尾追加过
+         * `minimumReleaseAge: 0` ⇒ 最后一行是它 ⇒ 判定失败 ⇒ 永远不转换。
+         * 日志证据：`IS_BLOCK_STYLE` 但文件明明以 `{` 开头。
+         *
+         * ⇒ 正确做法：从 `{` 开始扫，维护 depth；
+         *   depth 归零那一刻 = 最外层闭合 ⇒ 转换到此为止，
+         *   **它之后的内容原样保留**（那就是我们追加的设置）。 */
+        StringBuilder out = new StringBuilder();
+        int depth = 0;
+        boolean closed = false;
+        int i = startIdx;
+
+        for (; i < lines.length; i++) {
+            String t = lines[i].trim();
+            if (t.isEmpty()) continue;
+
+            if ("{".equals(t)) { depth++; continue; }
+            if ("}".equals(t) || "},".equals(t)) {
+                depth--;
+                if (depth == 0) { closed = true; i++; break; }  // 最外层闭合，结束
+                continue;
+            }
+
+            // 键值行：缩进 = (depth - 1) 层（最外层 { 不算一层）
+            String line = t.replaceAll(",[ \t]*$", "");
+            for (int k = 0; k < Math.max(0, depth - 1); k++) out.append("  ");
+            out.append(line).append('\n');
+        }
+
+        if (!closed) return src;      // 大括号没配平 ⇒ 不动
+
+        // 把 } 之后的内容原样保留（我们追加的 minimumReleaseAge 就在那里）
+        StringBuilder rest = new StringBuilder();
+        for (int k = i; k < lines.length; k++) {
+            if (!lines[k].trim().isEmpty()) rest.append(lines[k].trim()).append('\n');
+        }
+        String result = out.toString();
+        if (rest.length() > 0) result += "\n" + rest;
+        return result;
+    }
+
+
     /** 阻塞操作（几百 MB），必须在后台线程调用。 */
     static void install(Context c, Progress p) throws IOException {
         File rootfs = Cfg.rootfs(c);
@@ -876,6 +1269,48 @@ final class RootfsInstaller {
         }
 
         p.onProgress(100, "写入完成标记");
+
+        /* ★★★ 2026-10-20：**从解压出来的 rootfs 里清掉 npm 明文令牌**。
+         *
+         * 发现：rootfs 的 `root/.npmrc` 里带着一条真实的
+         *   //registry.npmjs.org/:_authToken=npm_xxx…
+         * 这个文件会随 APK 分发给**每一个下载者** ⇒ 等于把 npm 账号公开。
+         *
+         * 处理：
+         *   ① 保留 registry 设置（国内镜像，对用户有用）；
+         *   ② **删掉 _authToken 那一行**（以及任何含 token/密码的行）。
+         *
+         * ★ 为什么不直接重打 rootfs.gz.bin：392 MB 的包重打一次要很久，
+         *   而这是纯文本一行的删除 —— 解压后立即做，效果等价、代价近乎零。
+         * ★ 无论 assets 里的原始 rootfs 有没有这条，这里都做一次"根治"，
+         *   以后换 rootfs 也自动免疫。 */
+        try {
+            File npmrc = new File(rootfs, "root/.npmrc");
+            if (npmrc.exists()) {
+                StringBuilder keep = new StringBuilder();
+                java.io.BufferedReader br = new java.io.BufferedReader(
+                        new InputStreamReader(new FileInputStream(npmrc), StandardCharsets.UTF_8));
+                String line;
+                int dropped = 0;
+                while ((line = br.readLine()) != null) {
+                    String t = line.trim();
+                    // 丢掉任何形如 xxx=_authToken / token / password 的行
+                    if (t.matches("(?i).*(_authToken|_auth\\b|password|token)=.*")) {
+                        dropped++;
+                        continue;
+                    }
+                    keep.append(line).append('\n');
+                }
+                br.close();
+                writeText(npmrc, keep.toString());
+                Cfg.log(c, dropped > 0
+                        ? "已从 rootfs/.npmrc 清除 " + dropped + " 条凭据（保留 registry）"
+                        : "rootfs/.npmrc 无凭据，保持原样");
+            }
+        } catch (Throwable t) {
+            Cfg.log(c, "⚠️ 清理 npmrc 凭据失败（不影响启动）: " + t);
+        }
+
         try (FileOutputStream fos = new FileOutputStream(ready)) {
             fos.write("ok\n".getBytes());
         }
