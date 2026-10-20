@@ -456,6 +456,19 @@ public class MainActivity extends AppCompatActivity {
 
         // 顺便提示一下后台策略（不做开机自启，但要提醒用户别被系统杀）
         maybePromptBattery();
+
+        /* ★★★ 2026-10-21：验证「检查更新」用的**独立**标记轮询。
+           为什么不能挂在 dumpDiag 上：`startDiagLoop(40)` 只跑 40 次 ≈ 80 秒，
+           而实际启动（省电模式下）要 80~96 秒 ⇒ 循环往往在页面就绪前就结束了，
+           手动放标记文件时**已经没有人再检查**（实测踩到：放进去 8 秒没反应，
+           标记文件原样躺着）。⇒ 独立一个 5 秒轮询，与页面就绪与否无关。
+           ★ 命中后改名为 `.done`，同一台设备只跑一次；没有该文件时不做任何事。 */
+        ui.postDelayed(new Runnable() {
+            @Override public void run() {
+                tryTriggerUpdateCheck();
+                ui.postDelayed(this, 5000);
+            }
+        }, 5000);
     }
 
     /** 每隔 2 秒 dump 一次，连续 n 次。 */
@@ -474,8 +487,44 @@ public class MainActivity extends AppCompatActivity {
      *   但用户看到的仍是"没反应" ⇒ 问题在**渲染层**，不在逻辑层。
      *   只有拿到 width/display/transform/overflow 这些真实值，才能定位是哪条 CSS 没生效。
      */
+    /* ★★★ 2026-10-21：见 dumpDiag 里的说明 —— 文件触发的「检查更新」验证开关。
+       共享目录存在 `_trigger-update` 时调一次插件的 checkForUpdate；
+       插件会把判定依据 console.log 出来，经 onConsoleMessage 落到 web.log。
+       ★ 触发后立即把文件改名为 `.done`，保证**同一台设备只跑一次**，
+         免得每 2 秒 dump 一次就检查一次（那是网络请求，不该反复打）。 */
+    private void tryTriggerUpdateCheck() {
+        try {
+            File dir = Cfg.sharedRoot(this);
+            File flag = new File(dir, "_trigger-update");
+            if (!flag.exists()) return;
+            File done = new File(dir, "_trigger-update.done");
+            if (done.exists()) return;
+            if (!flag.renameTo(done)) return;      // 抢不到就说明别人处理了
+            Cfg.log(this, "[验证] 收到 _trigger-update，调用插件 checkForUpdate");
+            String call =
+                "(function(){try{"
+                + "if(typeof window.__dshCheckUpdate==='function'){window.__dshCheckUpdate();"
+                + "return 'called';}"
+                + "return 'NOT_EXPOSED';"
+                + "}catch(e){return 'ERR:'+e}})()";
+            webView.evaluateJavascript(call, v ->
+                Cfg.log(this, "[验证] checkForUpdate 返回 " + v));
+        } catch (Throwable t) {
+            Cfg.log(this, "[验证] 触发失败（不影响运行）: " + t);
+        }
+    }
+
     private void dumpDiag() {
         if (webView == null) return;
+        /* ★★★ 2026-10-21：**验证「检查更新」的触发开关**。
+           为什么要这个：WebView 里的菜单点不到（uiautomator 只看到空的 WebView 节点），
+           而「检查更新」的判定依据只写进 console / 弹层，我拿不到。
+           ⇒ 加一个文件触发：共享目录里有 `_trigger-update` 就调一次插件的检查函数，
+             结果由插件自己 console.log 出来（`[DSH-DIAG] update-check {...}`），
+             App 的 onConsoleMessage 会把它转进 web.log。
+           ★ 用完把文件删掉即可，不影响正常运行；没有该文件时**一次都不会触发**。
+           ★ 必须放在赋值之后、且全程 try/catch —— 诊断绝不能影响主流程。 */
+        tryTriggerUpdateCheck();
         String js =
             "(function(){try{" +
             "var h=document.documentElement;" +

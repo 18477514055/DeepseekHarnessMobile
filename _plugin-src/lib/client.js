@@ -2900,6 +2900,14 @@ html[data-dsh-seat-tray="open"] #dsh-st-panel { display: flex; }
       if (window.__dshUpdateChecker) return;
       window.__dshUpdateChecker = true;
 
+      /* ★★★ 2026-10-21：把检查函数暴露到 window。
+         为什么需要：验证「检查更新」到底能不能识别新版本时，
+         我点不到 WebView 里的菜单（uiautomator 只看到一个空的 WebView 节点），
+         而判定依据只进 console / 弹层。
+         ⇒ 暴露一个**只读触发口**，让 App 侧能用 evaluateJavascript 调一次。
+         ★ 这不是给用户用的 API，不改变任何默认行为；没有调用方时完全无副作用。 */
+      try { window.__dshCheckUpdate = checkForUpdate; } catch (e) { }
+
       var tries = 0;
       var timer = setInterval(function () {
         tries++;
