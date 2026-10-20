@@ -75,7 +75,7 @@ build.cmd release    :: release APK
 |---|---|---|
 | `android/app/src/main/assets/rootfs.gz.bin` | 376 MB（394,325,574 B） | Debian rootfs（gzip），解压后 82,392 个条目 |
 | `android/app/src/main/assets/pnpm-incr.gz.bin` | 22.1 MB（23,219,739 B） | pnpm 二进制增量包 |
-| `android/app/src/main/assets/mobile-adapt.gz.bin` | 123 KB（125,811 B） | 内置移动端插件（由 `_pk.cjs` 生成） |
+| `android/app/src/main/assets/mobile-adapt.gz.bin` | 124 KB（126,494 B） | 内置移动端插件（由 `_pk.cjs` 生成） |
 | `android/app/src/main/assets/使用指南.md` | 8.3 KB | 随包分发的使用指南，启动时复制到共享目录 |
 
 ★ 后缀是 `.gz.bin` 而不是 `.gz` —— **AGP 会自动解压 `.gz`**，把 376 MB 变成 1.3 GB。
@@ -114,9 +114,11 @@ docs/                  实证报告与工程说明
 
 - **不上架**：targetSdk=28 是硬约束。
 - **不做开机自启**：Android 会因此限制应用（这是刻意设计），改为「点开后常驻」。
-- **首次启动慢**：要解压 376 MB rootfs。实测从进程启动到页面可用为 **94~107 秒**
-  （Android 15 / OPPO PHW110；两次测量分别是升级后首启 106.8 秒、纯重启 94.0 秒）。
-  启动期间界面停在启动页，属正常现象。
+- **首次启动要解压 376 MB rootfs**，实测**冷启动 18.4 秒**到页面可用
+  （`JZQ8H6U46PBY9PV8` / Android 16 / 1.0.4）。启动期间界面停在启动页，属正常现象。
+  ★ **开着省电模式时会慢很多**（实测同一台机同一版本 29~96 秒）——
+  省电会压低 CPU 频率，而 proot 容器的启动对频率很敏感。
+  要稳定在 18 秒左右，请把本应用加入省电白名单，或临时关掉省电。
 - **仅 arm64-v8a**。
 - **需要较新的 WebView**：界面使用 Chrome 85+ 语法，系统 WebView 低于 85 会白屏
   （详见 `使用指南.md` 第 5 节）。
