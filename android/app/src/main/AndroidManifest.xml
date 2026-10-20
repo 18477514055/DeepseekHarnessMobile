@@ -81,13 +81,27 @@
 
 
 
+    <!-- ★★★ 2026-10-20（真机白屏后修）：requestLegacyExternalStorage 必须是 true。
+         这一条只在 **Android 10（API 29）** 上生效 —— 它是唯一既引入
+         scoped storage、又认这个开关的版本。
+
+         原来写的是 false（等于「明确不要 legacy 模式」），结果：
+           · /sdcard/DeepseekHarness/ 目录建不出来 ⇒ 日志写不了 ⇒ 白屏
+           · READ/WRITE_EXTERNAL_STORAGE 明明 granted=true 也没用
+             （scoped storage 下这两个权限不再给 /sdcard 根目录的写权限）
+
+         ★ 自家设备是 Android 16，这个标志**早被系统忽略**（API 30+ 不再认它），
+           所以一直测不出来 —— 又一个"高版本开发机掩盖低版本问题"。
+
+         ★ 我们 targetSdk=28，在 API 29 上本来默认就是 legacy 模式，
+           但**显式写 false 会覆盖默认值**把它关掉。写 true 才是我们要的。 -->
     <application
         android:allowBackup="false"
         android:extractNativeLibs="true"
         android:icon="@mipmap/ic_launcher"
         android:label="@string/app_name"
         android:usesCleartextTraffic="true"
-        android:requestLegacyExternalStorage="false"
+        android:requestLegacyExternalStorage="true"
         android:theme="@style/Theme.DshMobile">
 
         <activity

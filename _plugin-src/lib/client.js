@@ -1165,31 +1165,91 @@ html[data-dsh-seat-tray="open"] #dsh-st-panel { display: flex; }
      *   2) 轮询已发布版本，比「已安装」新就自动下载并拉安装器
      *   3) 约 8 秒仍无新版则提示已是最新
      */
+    /**
+     * 点「检查更新」后的流程。
+     *
+     * ★★★ 2026-10-20 重写（用户要求「自动检查 github，加几个可用的镜像源」）：
+     *
+     *   原实现只读 `/dsh-version.json` —— **那个文件我们从来没提供过**，
+     *   所以它每次都走「4 次 2 秒后提示已是最新」的兜底路径，**从来没真正检查过**。
+     *   这就是为什么它一直在菜单里，却没人觉得它能用。
+     *
+     *   新流程：
+     *     ① 先并发查 GitHub（官方 API + ghfast.top 镜像，见 fetchLatestVersion）
+     *     ② 拿到版本号就跟当前版本比 —— 弹出结果层（有新版给「去下载」）
+     *     ③ 全都拿不到 ⇒ 退回原逻辑（让 App 壳扫本地已下载的安装包）
+     *
+     *   ★ 为什么保留 ③：有些用户是**手动下载 APK 再装**的，
+     *     App 壳那套「扫存储里的安装包」对他们是有效的补充。
+     */
     function checkForUpdate() {
       if (updateBusy) return;
       updateBusy = true;
+
+      var cur = currentVersion();
+      showToast(cur.name && cur.name !== "?"
+        ? ("\u6b63\u5728\u68c0\u67e5\u66f4\u65b0\uff08\u5f53\u524d " + cur.name + "\uff09\u2026")
+        : "\u6b63\u5728\u68c0\u67e5\u66f4\u65b0\u2026");
+
+      fetchLatestVersion(function (err, res) {
+        updateBusy = false;
+
+        if (!err && res) {
+          var curSemver = parseVer(cur.name);
+          var newer = curSemver ? verNewer(res.version, curSemver) : false;
+          showUpdateDialog({
+            ok: true,
+            newer: newer,
+            unknownCur: !curSemver,
+            latest: res.tag,
+            source: res.source,
+            apkUrl: res.apkUrl,
+            cur: cur
+          });
+          return;
+        }
+
+        /* 在线源全挂 ⇒ 退回原逻辑：让 App 壳扫本地已下载的安装包 */
+        legacyCheckForUpdate(err);
+      });
+    }
+
+    /**
+     * 兜底：原来的本地扫描逻辑（`/dsh-version.json` + DshShell.checkUpdate）。
+     * ★ 只在在线检查全失败时走这条路，并且**如实告诉用户在线检查失败了**。
+     */
+    function legacyCheckForUpdate(onlineErr) {
       try { if (window.DshShell && window.DshShell.checkUpdate) window.DshShell.checkUpdate(); } catch (e) {}
       var tries = 0;
+      var found = false;
       var timer = setInterval(function () {
         tries++;
         if (tries > 4) {
-          clearInterval(timer); updateBusy = false;
-          showToast("\u5df2\u662f\u6700\u65b0\u7248\u672c\uff08v" + (window.__DSH_APP_VERSION_NAME || window.__DSH_APP_VERSION || "?") + "\uff09");
+          clearInterval(timer);
+          updateBusy = false;
+          if (!found) {
+            showUpdateDialog({
+              ok: false,
+              title: "\u68c0\u67e5\u5931\u8d25",
+              body: "\u5728\u7ebf\u68c0\u67e5\u6ca1\u62ff\u5230\u7ed3\u679c\uff08GitHub \u53ca\u955c\u50cf\u90fd\u4e0d\u53ef\u8fbe\uff09\uff0c\n"
+                  + "\u672c\u5730\u4e5f\u6ca1\u627e\u5230\u5df2\u4e0b\u8f7d\u7684\u65b0\u7248\u5b89\u88c5\u5305\u3002\n\n"
+                  + "\u5e38\u89c1\u539f\u56e0\uff1a\u6ca1\u8054\u7f51 / \u6d41\u91cf\u88ab\u9650 / GitHub \u4e0d\u53ef\u8fbe\n\n"
+                  + (onlineErr && onlineErr.all ? ("\u8be6\u60c5\uff1a\n" + onlineErr.all.join("\n")) : ""),
+              cur: currentVersion()
+            });
+          }
           return;
         }
         fetch("/dsh-version.json", { cache: "no-store" })
           .then(function (r) { return r.ok ? r.json() : null; })
           .then(function (d) {
             if (!d || !d.versionCode) return;
-            var cur = window.__DSH_APP_VERSION || 0;
-            if (d.versionCode > cur) {
-              clearInterval(timer); updateBusy = false;
+            var curCode = window.__DSH_APP_VERSION || 0;
+            if (d.versionCode > curCode) {
+              found = true;
+              clearInterval(timer);
+              updateBusy = false;
               startUpdateDownload(d);
-              return;
-            }
-            if (tries >= 3) {
-              clearInterval(timer); updateBusy = false;
-              showToast("\u5df2\u662f\u6700\u65b0\u7248\u672c\uff08v" + (window.__DSH_APP_VERSION_NAME || cur) + "\uff09");
             }
           })
           .catch(function () {});
@@ -1491,7 +1551,13 @@ html[data-dsh-seat-tray="open"] #dsh-st-panel { display: flex; }
     function injectMenuItems() {
       var diag = [];
       try {
-        syncMovedChips();
+        /* ★★★ 2026-10-20：**不再调用 syncMovedChips()**。
+         *
+         *   它会把官方的「后台任务」「Agent 预设」两个 chip **隐藏掉**
+         *   （hideJobsChip / hidePresetChip），原本是为了"搬进菜单"。
+         *   现在我们只在菜单里加一项「检查更新」，不搬任何 chip
+         *   ⇒ 若还调它，官方那两个 chip 会被藏掉却没人接手 = **两处都看不见**。
+         *   （这条正是 2026-10-19 停用注入器时注释里警告过的坑。） */
         var more = document.querySelector('button[class*="moreButton"]');
         diag.push("\u22ee:" + (more ? "\u2713" : "\u2717"));
         if (!more) { window.__dshMenuDiag = diag.join(" "); return; }
@@ -1527,116 +1593,31 @@ html[data-dsh-seat-tray="open"] #dsh-st-panel { display: flex; }
 
         var want = [];
 
-        /* ★ 2026-10-06：⋮ 菜单镜像「官方侧栏」的按键（用户 m07110）。
-           名字逐字抄官方文案，与侧栏里看到的一致；用户不必再展开侧栏去点它们。
-           顺序：回到主界面 → 唤出侧边栏 → 官方侧栏 5 键（新建会话/插件/自动化任务/
-                 搜索会话/添加工作区）→ 设置。
-           ★ 「回到主界面」放最前：它是"离当前上下文最远"的动作，且用户明确新加的一项。 */
-        want.push({ key: "sidebar", label: "\u5524\u51fa\u4fa7\u8fb9\u680f", icon: ICON_SIDEBAR, run: openSidebar });
-        want.push({ key: "newChat", label: "\u65b0\u5efa\u4f1a\u8bdd", icon: ICON_NEWCHAT, run: startNewChat });
-        want.push({ key: "panelPlugins", label: "\u63d2\u4ef6", icon: ICON_PLUGIN, run: function () { openPanelById("plugins"); } });
-        want.push({ key: "panelSchedules", label: "\u81ea\u52a8\u5316\u4efb\u52a1", icon: ICON_SCHEDULE, run: function () { openPanelById("schedules"); } });
-        want.push({ key: "search", label: "\u641c\u7d22\u4f1a\u8bdd", icon: ICON_SEARCH, run: openSessionSearch });
-        want.push({ key: "addWs", label: "\u6dfb\u52a0\u5de5\u4f5c\u533a", icon: ICON_ADDWS, run: addWorkspace });
-        want.push({ key: "settings", label: "\u8bbe\u7f6e", icon: ICON_SETTINGS, run: openSettings });
-
-        if (jobsRoot) {
-          var cnt = jobsRoot.querySelector(JOBS_COUNT);
-          var txt = cnt ? (cnt.textContent || "").trim() : "";
-          want.push({
-            key: "jobs",
-            label: txt ? "\u540e\u53f0\u4efb\u52a1 \u00b7 " + txt : "\u540e\u53f0\u4efb\u52a1",
-            icon: ICON_JOBS, run: openJobsList
-          });
-        }
-        if (preset) {
-          var ps = preset.querySelector("svg");
-          want.push({
-            key: "preset",
-            label: (preset.textContent || "").trim() || "Agent \u9884\u8bbe",
-            icon: ps ? ps.outerHTML : "", run: null
-          });
-        }
-        /* 刷新永远在：即使两个芯片都没找到，这一项也必须注入 */
-        /* [projection] 电脑 DSH —— 把电脑端 DSH 的官方界面投到手机上。
-           ★ 用户要求：「像 DS 网页版和开放平台那样子直接打开一个 web」
-             ⇒ 走 APK 桥 `DshShell.openUrl(url, title)`（应用内独立 WebView，
-                与「DS 网页版 / 开放平台」同款体验）。
-           ★ 目标是**固定地址**（Pages Functions 反代）⇒ 电脑端重启换隧道也不影响。
-             它落到 /proj-pair/enter：配对过就直接给官方界面，
-             没配对就给配对页（扫码或手输 8 位配对码）。
-           ★ 桥不在（浏览器里打开）时退化为新标签页，不让这一项变成死的。 */
-        want.push({
-          key: "computerDsh",
-          label: "\u7535\u8111 DSH",
-          icon: ICON_COMPUTER,
-          run: function () {
-            var url = "https://dsh-projection.pages.dev/proj-pair/enter";
-            try {
-              if (window.DshShell && typeof window.DshShell.openUrl === "function") {
-                window.DshShell.openUrl(url, "\u7535\u8111 DSH");
-                return;
-              }
-            } catch (e) {}
-            try { window.open(url, "_blank"); } catch (e) {}
-          }
-        });
-
-        want.push({ key: "refresh", label: "\u5237\u65b0\u9875\u9762", icon: ICON_REFRESH, run: refreshPageNow });
-
-        /* 原生壳提供的后台自启控制（浏览器里没有 window.DshShell，自动跳过） */
-        var shell = dshShellState();
-        if (shell) {
-          if (!shell.termuxPerm) {
-            want.push({
-              key: "setup",
-              label: "\u6388\u4e88\u300c\u5728 Termux \u4e2d\u8fd0\u884c\u547d\u4ee4\u300d\u6743\u9650",
-              icon: ICON_POWER,
-              run: function () { try { window.DshShell.requestSetup(); } catch (e) {} }
-            });
-          }
-          /* ★ 2026-10-06：原「启动 DSH 服务 / 停止 DSH 服务」两项合并为这一项。
-             旧的为什么坏：页面本身由内核提供 —— 点「停止」= 自杀（页面随即失联），
-             点「启动」又因服务已在跑而空转；更要命的是「杀内核」这件事从 Termux
-             侧根本做不到（SELinux 域不同，kill 一律 Permission denied），用户看到
-             的就是"这两项失效了"。
-             现在点一下 → POST /dsh-mobile/kernel-restart → 服务端半（跑在内核里）
-             经 am 投递 Termux 侧重拉脚本，然后给自己 SIGTERM → 内核退出并重新拉取，
-             专治不支持热加载的插件。详见 kernelRestartNow() 上方注释。 */
-          want.push({
-            key: "svcrestart",
-            label: "\u91cd\u542f\u5185\u6838\uff08\u6740\u6b7b\u5e76\u91cd\u62c9\uff09" + (shell.termuxPerm ? "" : "  \u5f85\u6388\u6743"),
-            icon: ICON_SWAP,
-            run: kernelRestartNow
-          });
-          /* 应用内打开（独立 WebView，无 JS 桥；不上传文件；允许截屏） */
-          want.push({
-            key: "panechat", label: "DeepSeek \u7f51\u9875\u7248", icon: ICON_GLOBE,
-            run: function () { try { window.DshShell.openPane("chat"); } catch (e) {} }
-          });
-          want.push({
-            key: "paneplat", label: "DeepSeek \u5f00\u653e\u5e73\u53f0", icon: ICON_KEY,
-            run: function () { try { window.DshShell.openPane("platform"); } catch (e) {} }
-          });
-        }
-
-        /* ========== 内核切换三项:已按用户要求移除（2026-10-05）==========
-           原「切到新版内核 v0.2.0 / 切回旧版内核 v0.1.5 / 内核切换状态」三项走
-           window.DshShell.repair("kernel-new"|"kernel-old"|"kernel-status")。
-           移除理由：旧版 0.1.5 已冻结（包目录改名，任何入口都起不来），
-           新版容器 0.2.0 是唯一可用内核 ⇒ 三项点下去都没有实际意义，
-           留在菜单里只会让人误以为还能切回去。
-           ★ 如果将来真的需要回滚能力，恢复办法：把这段 if (shell) {...} 加回来即可，
-             APK 侧的 repair() 桥方法还在（dex 里已核实存在），不用改 APK。 */
-
-        /* 检查更新：扫描存储里的安装包 → 有新版就自动下载并拉起安装器 */
+        /* ★★★ 2026-10-19 / 2026-10-20 两次要求的合并结果 —— **只注入这一项**。
+         *
+         *   2026-10-19 用户第 4 条要求（原话见下方 installMenuInjector 处的注释）：
+         *     「⋮ 菜单清空所有非官方注入项，直接用官方原生菜单。以后要加功能再单独说。」
+         *     ⇒ 当时把整个 menuInjector 摘了注册，菜单只剩官方的
+         *        「下载 Session 日志」「反馈」两项。
+         *
+         *   2026-10-20 用户「单独说」的那一个功能：
+         *     「往右上角的菜单（有下载session日志和反馈）里加一个检查更新，
+         *       自动检查github（加几个可用的镜像源）上面的最新版本」
+         *
+         *   ⇒ **恢复注入器，但只注入「检查更新」一项。**
+         *     其它 15 项（唤出侧边栏 / 新建会话 / 插件 / 自动化任务 / 搜索会话 /
+         *     添加工作区 / 设置 / 后台任务 / Agent 预设 / 电脑 DSH / 刷新页面 / …）
+         *     **一律不注入**，保持 10-19 那个"就用官方原生菜单"的状态。
+         *
+         * ★ 想恢复某一项：从这里加一行 want.push(...) 即可，
+         *   对应的 run 函数（openSidebar / startNewChat / openSettings …）都还在。
+         */
         want.push({
           key: "update",
-          label: "\u68c0\u67e5\u66f4\u65b0  v" + (window.__DSH_APP_VERSION_NAME || (shell && shell.versionName) || "?"),
+          label: "\u68c0\u67e5\u66f4\u65b0",
           icon: ICON_UPDATE,
           run: checkForUpdate
         });
-
         var stamp = want.map(function (w) { return w.key + ":" + w.label; }).join("|");
         /* 长期诊断：把"打算注入哪些项"记下来，供自我检查页面在 APK 里回读。
            只写变量，没有任何副作用（不点菜单、不发请求）。 */
@@ -1684,9 +1665,12 @@ html[data-dsh-seat-tray="open"] #dsh-st-panel { display: flex; }
         }
         if (ok) m.setAttribute("data-dsh-menu", stamp);
         diag.push("\u6ce8\u5165:" + ok + "/" + want.length);
-        /* 注入成功才隐藏原生芯片，失败则芯片留着，入口不会丢 */
-        if (ok && jobsRoot) document.documentElement.setAttribute("data-dsh-moved-jobs", "1");
-        if (ok && preset) document.documentElement.setAttribute("data-dsh-moved-preset", "1");
+        /* ★★★ 2026-10-20：**不再给 html 打 moved-jobs / moved-preset 标记**。
+         *
+         *   原来注入成功就打标记，CSS 靠它隐藏官方那两个 chip（见 CSS 段 L300/L305/L311/L317）。
+         *   但我们现在的 `want[]` 里**没有**「后台任务」「Agent 预设」这两项
+         *   ⇒ 打了标记只会把它们藏掉、菜单里又没有替代品 = **两处都看不见**。
+         *   ⇒ 这一整块删除；官方 chip 保持原样显示。 */
       } catch (e) {
         diag.push("err:" + (e && e.message || e));
       }
@@ -2561,7 +2545,357 @@ html[data-dsh-seat-tray="open"] #dsh-st-panel { display: flex; }
       } catch (e) { throw e; }
     }
 
-    /* ========== 页面内一键更新（仅 App 内生效） ========== */
+    /* ========== 检查更新（GitHub + 镜像源） ==========
+     *
+     * ★★★ 2026-10-20（用户要求）：
+     *   「往右上角的菜单里加一个检查更新，自动检查 github（加几个可用的镜像源）
+     *     上面的最新版本」
+     *
+     * ★ 设计要点（每一条都是被现实逼出来的）：
+     *
+     * ① **必须多源并行 + 竞速**，不能一个一个试。
+     *    原因：容器里实测 `api.github.com` 有时通、有时被墙，
+     *    串行试 4 个源、每个等 8 秒 = 最坏 32 秒，用户早就不耐烦了。
+     *    ⇒ 全部并发发起，**第一个成功解析的胜出**。
+     *
+     * ② **镜像源要知道自己在镜像什么**：
+     *    GitHub 加速镜像（ghproxy 之类）**只代理下载链接，不代理 api.github.com**。
+     *    ⇒ 镜像只能用来拉 **Release 的 HTML 页面或 latest 重定向**，拿不到 REST JSON。
+     *    所以对镜像的解析方式必须和 api 不同（见 parseHtmlTag / parseLatestLocation）。
+     *
+     * ③ **失败要说人话**，不能只弹「网络错误」。
+     *    区分三种：全都不通（网络问题）/ 通但解析不出（GitHub 改版）/ 拿到的版本号不合法。
+     *
+     * ④ **永不阻塞 UI**：点完立刻返回，结果用 alert 呈现（手机上 alert 是最稳的）。
+     */
+
+    /** GitHub 仓库（发布 APK 的地方）。 */
+    var UPDATE_REPO = "18477514055/DeepseekHarnessMobile";
+
+    /**
+     * 更新源清单。
+     *
+     * ★★★ 2026-10-20 **逐个实测过**（不是网上抄一份列表就塞进来）：
+     *
+     * | 源 | 结果 |
+     * |---|---|
+     * | `api.github.com/.../releases/latest` | ✅ 返回 `tag=v1.0.2`，还带 assets 里的 APK 直链 |
+     * | `github.com/.../releases/latest`（网页） | ❌ **超时**（本机网络下网页版不通） |
+     * | `ghfast.top/https://github.com/...` | ✅ 返回页面，含 `v1.0.2` |
+     * | `gh-proxy.com` | ❌ HTTP 403 |
+     * | `ghproxy.net` | ❌ 超时 |
+     * | `ghproxy.cc` | ❌ SSL 握手失败 |
+     * | `hub.gitmirror.com` | ❌ DNS 解析失败 |
+     *
+     * ⇒ 只保留**实测能用的**两条：官方 API + ghfast.top。
+     * ★ 把不通的源写进去是负资产：并发时要等它们超时，还会在错误列表里刷屏。
+     *
+     * `kind` 决定怎么解析：
+     *   · `api`   —— GitHub REST，返回 JSON（最可靠，能直接给 APK 直链）
+     *   · `html`  —— Release 页 HTML，从最终 URL 或页面里抠 tag
+     *   · `proxy` —— 加速镜像，行为同 html
+     */
+    var UPDATE_SOURCES = [
+        { kind: "api", url: "https://api.github.com/repos/" + UPDATE_REPO + "/releases/latest" },
+        { kind: "proxy", url: "https://ghfast.top/https://github.com/" + UPDATE_REPO + "/releases/latest" }
+    ];
+
+    /** 当前 App 版本（由 APK 注入 window.__DSH_APP_VERSION*）。 */
+    function currentVersion() {
+        var code = window.__DSH_APP_VERSION;
+        var name = window.__DSH_APP_VERSION_NAME;
+        return {
+            code: typeof code === "number" ? code : (parseInt(code, 10) || 0),
+            name: name || (code ? String(code) : "?")
+        };
+    }
+
+    /** 把 "v1.0.2" / "1.0.2" 解析成可比较的 [1,0,2]。 */
+    function parseVer(s) {
+        if (!s) return null;
+        var m = String(s).match(/(\d+)\.(\d+)\.(\d+)/);
+        if (!m) return null;
+        return [parseInt(m[1], 10), parseInt(m[2], 10), parseInt(m[3], 10)];
+    }
+
+    /** a 比 b 新 ⇒ 返回 true。 */
+    function verNewer(a, b) {
+        if (!a || !b) return false;
+        for (var i = 0; i < 3; i++) {
+            if (a[i] > b[i]) return true;
+            if (a[i] < b[i]) return false;
+        }
+        return false;
+    }
+
+    /** 从 HTML 里抠版本号。GitHub 的 releases/latest 页会带 tag。 */
+    function parseHtmlTag(html) {
+        if (!html) return null;
+        var pats = [
+            /\/releases\/tag\/v?(\d+\.\d+\.\d+)/,
+            /"tag_name"\s*:\s*"v?(\d+\.\d+\.\d+)"/,
+            /Release\s+v?(\d+\.\d+\.\d+)/i,
+            /v(\d+\.\d+\.\d+)/   /* 兜底：页面上随便一个 vX.Y.Z */
+        ];
+        for (var i = 0; i < pats.length; i++) {
+            var m = html.match(pats[i]);
+            if (m) return m[1];
+        }
+        return null;
+    }
+
+    /**
+     * 专门给镜像源用的取版本方式：**不跟重定向，只读 Location 头**。
+     *
+     * ★★★ 为什么不能用 fetch（实测结论）：
+     *
+     *   镜像 `https://ghfast.top/https://github.com/.../releases/latest`
+     *   **返回 302，body 是空的**，版本号只在 `Location` 里：
+     *     location: /https://github.com/18477514055/DeepseekHarnessMobile/releases/tag/v1.0.2
+     *
+     *   · 用 `redirect:"follow"` ⇒ 浏览器跟到真 github.com
+     *     ⇒ **本机网络下 github.com 超时** ⇒ 镜像白搭
+     *   · 用 `redirect:"manual"` ⇒ fetch 给 opaque-redirect 响应，
+     *     跨域读不到 Location 头 ⇒ 也失败
+     *
+     * ⇒ 用 **XHR**：`followRedirects=false` 时 XHR 会停在 302，
+     *   且镜像站普遍带 `Access-Control-Expose-Headers: Location`，
+     *   所以 `getResponseHeader("Location")` 能读到。
+     *   ★ 万一某个镜像没暴露这个头，就退回去读 body（有些镜像直接给 HTML）。
+     */
+    function fetchProxyTag(url, cb) {
+        var finished = false;
+        function fin(err, tag) {
+            if (finished) return;
+            finished = true;
+            cb(err, tag);
+        }
+        try {
+            var xhr = new XMLHttpRequest();
+            xhr.open("GET", url, true);
+            xhr.timeout = 9000;
+            try { xhr.setRequestHeader("Cache-Control", "no-store"); } catch (e) { }
+            xhr.onreadystatechange = function () {
+                /* ★ 关键：在 HEADERS_RECEIVED(2) 就读头，此时已拿到 302 与 Location，
+                   但请求**还没**继续跟下去（followRedirects=false 时不会跟） */
+                if (xhr.readyState === 2) {
+                    var loc = null;
+                    try { loc = xhr.getResponseHeader("Location"); } catch (e) { }
+                    if (loc) {
+                        var m = loc.match(/\/releases\/tag\/v?(\d+\.\d+\.\d+)/)
+                             || loc.match(/\/tag\/v?(\d+\.\d+\.\d+)/);
+                        if (m) { try { xhr.abort(); } catch (e2) { } fin(null, m[1]); return; }
+                    }
+                }
+                if (xhr.readyState === 4) {
+                    /* 不是 302，或没读到头 ⇒ 从 body 里抠 */
+                    var txt = "";
+                    try { txt = xhr.responseText || ""; } catch (e) { }
+                    var tag = parseHtmlTag(txt);
+                    if (tag) { fin(null, tag); return; }
+                    fin("HTTP " + xhr.status + "，无版本号");
+                }
+            };
+            xhr.ontimeout = function () { fin("timeout"); };
+            xhr.onerror = function () { fin("network error"); };
+            xhr.send(null);
+        } catch (e) {
+            fin((e && e.message) || "xhr throw");
+        }
+    }
+
+    /**
+     * 并发请求所有源，第一个拿到合法版本号的胜出。
+     * @param cb function(err, {version, source, apkUrl})
+     */
+    function fetchLatestVersion(cb) {
+        var settled = false;
+        var errors = [];
+        var pending = UPDATE_SOURCES.length;
+        var TIMEOUT_MS = 9000;
+
+        function done(err, res) {
+            if (settled) return;
+            settled = true;
+            cb(err, res);
+        }
+
+        UPDATE_SOURCES.forEach(function (src) {
+            var finished = false;
+            var timer = setTimeout(function () {
+                if (finished) return;
+                finished = true;
+                errors.push(src.kind + ": timeout");
+                if (--pending === 0 && !settled) done({ all: errors });
+            }, TIMEOUT_MS);
+
+            function settle(err, res) {
+                if (finished) return;
+                finished = true;
+                clearTimeout(timer);
+                if (err) {
+                    errors.push(src.kind + ": " + err);
+                    if (--pending === 0 && !settled) done({ all: errors });
+                    return;
+                }
+                done(null, res);
+            }
+
+            /* ★ proxy 源走 XHR（要读 Location 头），api 源走 fetch（拿 JSON） */
+            if (src.kind === "proxy") {
+                fetchProxyTag(src.url, function (err, tag) {
+                    if (err) { settle(err); return; }
+                    var v = parseVer(tag);
+                    if (!v) { settle("bad tag: " + tag); return; }
+                    settle(null, { version: v, tag: tag, source: src.url, apkUrl: null });
+                });
+                return;
+            }
+
+            try {
+                fetch(src.url, { cache: "no-store", redirect: "follow" })
+                    .then(function (r) {
+                        if (!r.ok) throw new Error("HTTP " + r.status);
+                        return r.json().then(function (j) {
+                            var tag = j && j.tag_name;
+                            var v = parseVer(tag);
+                            if (!v) throw new Error("no tag_name");
+                            var apk = null;
+                            var assets = (j && j.assets) || [];
+                            for (var i = 0; i < assets.length; i++) {
+                                if (/\.apk$/i.test(assets[i].name || "")) {
+                                    apk = assets[i].browser_download_url;
+                                    break;
+                                }
+                            }
+                            return { version: v, tag: tag, source: src.url, apkUrl: apk };
+                        });
+                    })
+                    .then(function (res) { settle(null, res); })
+                    .catch(function (e) { settle((e && e.message) || "fetch failed"); });
+            } catch (e) {
+                settle((e && e.message) || "throw");
+            }
+        });
+    }
+
+/**
+     * 检查更新的结果弹层。
+     *
+     * ★ 为什么不用 alert：
+     *   · 没法放「去下载」按钮（alert 只有确定/取消）
+     *   · 要展示多条源错误时，alert 在手机上排版极差
+     * ★ 为什么不用官方弹层：那是官方的，塞进去要抢座位，容易和别的注入打架。
+     *   ⇒ 自己造一个**高层级、可关闭、点遮罩关掉**的轻量层，用完即删，零残留。
+     */
+    function showUpdateDialog(d) {
+        try {
+            var old = document.getElementById("dsh-update-dlg");
+            if (old && old.parentNode) old.parentNode.removeChild(old);
+
+            var wrap = document.createElement("div");
+            wrap.id = "dsh-update-dlg";
+            wrap.style.cssText = "position:fixed;inset:0;z-index:2147483000;"
+                + "background:rgba(0,0,0,.45);display:flex;align-items:center;"
+                + "justify-content:center;padding:20px;";
+
+            var box = document.createElement("div");
+            box.style.cssText = "background:#fff;color:#222;border-radius:14px;"
+                + "max-width:420px;width:100%;max-height:80vh;overflow:auto;"
+                + "padding:18px 16px;font-size:14px;line-height:1.6;"
+                + "box-shadow:0 8px 32px rgba(0,0,0,.28);";
+
+            var h = document.createElement("div");
+            h.style.cssText = "font-size:16px;font-weight:600;margin-bottom:10px;";
+            h.textContent = d.ok
+                ? (d.newer ? "\u53d1\u73b0\u65b0\u7248\u672c"
+                           : (d.unknownCur ? "\u8fdc\u7aef\u6700\u65b0\u7248\u672c" : "\u5df2\u662f\u6700\u65b0\u7248"))
+                : (d.title || "\u68c0\u67e5\u5931\u8d25");
+            box.appendChild(h);
+
+            var body = document.createElement("div");
+            body.style.cssText = "white-space:pre-wrap;word-break:break-word;opacity:.9;";
+            if (d.ok) {
+                var curName = d.cur && d.cur.name ? d.cur.name : "?";
+                if (d.unknownCur) {
+                    /* 拿不到可比较的当前版本号 —— 如实说，不假装能比较 */
+                    body.textContent = "\u8fdc\u7aef\u6700\u65b0\uff1a" + d.latest + "\n\n"
+                        + "\u5f53\u524d\u7248\u672c\u53f7\u8bfb\u4e0d\u5230\uff0c\u65e0\u6cd5\u81ea\u52a8\u5224\u65ad\u662f\u5426\u66f4\u65b0\u3002\n"
+                        + "\u4f60\u53ef\u4ee5\u76f4\u63a5\u53bb\u53d1\u5e03\u9875\u5bf9\u7167\u3002";
+                } else {
+                    body.textContent = d.newer
+                        ? ("\u5f53\u524d\u7248\u672c\uff1a" + curName + "\n"
+                           + "\u6700\u65b0\u7248\u672c\uff1a" + d.latest + "\n\n"
+                           + "\u6765\u6e90\uff1a" + d.source)
+                        : ("\u5f53\u524d\u7248\u672c\uff1a" + curName + "\n"
+                           + "\u8fdc\u7aef\u6700\u65b0\uff1a" + d.latest + "\n\n"
+                           + "\u4f60\u5df2\u7ecf\u662f\u6700\u65b0\u7248\u4e86\u3002");
+                }
+            } else {
+                body.textContent = d.body || "";
+            }
+            box.appendChild(body);
+
+            var btns = document.createElement("div");
+            btns.style.cssText = "display:flex;gap:10px;margin-top:16px;flex-wrap:wrap;";
+
+            function mkBtn(text, primary, onClick) {
+                var b = document.createElement("button");
+                b.type = "button";
+                b.textContent = text;
+                b.style.cssText = "flex:1;min-width:110px;padding:10px 14px;border-radius:10px;"
+                    + "font-size:14px;cursor:pointer;border:1px solid "
+                    + (primary ? "#4D6BFE;background:#4D6BFE;color:#fff;"
+                               : "rgba(0,0,0,.22);background:#fff;color:#333;");
+                b.addEventListener("click", onClick, false);
+                return b;
+            }
+
+            function close() {
+                try { if (wrap.parentNode) wrap.parentNode.removeChild(wrap); } catch (e) {}
+                document.removeEventListener("keydown", onKey, true);
+            }
+            function onKey(ev) {
+                if (ev && (ev.key === "Escape" || ev.keyCode === 27)) close();
+            }
+
+            if (d.ok && d.newer) {
+                btns.appendChild(mkBtn("\u53bb\u4e0b\u8f7d", true, function () {
+                    var url = d.apkUrl || ("https://github.com/" + UPDATE_REPO + "/releases/latest");
+                    try {
+                        if (window.DshShell && typeof window.DshShell.openUrl === "function") {
+                            window.DshShell.openUrl(url, "\u4e0b\u8f7d\u65b0\u7248");
+                            close();
+                            return;
+                        }
+                    } catch (e) {}
+                    try { window.open(url, "_blank"); } catch (e2) { location.href = url; }
+                    close();
+                }));
+            }
+            btns.appendChild(mkBtn("\u5173\u95ed", !(d.ok && d.newer), close));
+            box.appendChild(btns);
+            wrap.appendChild(box);
+
+            wrap.addEventListener("click", function (ev) {
+                if (ev.target === wrap) close();
+            }, false);
+            document.addEventListener("keydown", onKey, true);
+
+            document.body.appendChild(wrap);
+        } catch (e) {
+            try {
+                if (d.ok) {
+                    alert(d.newer
+                        ? ("\u53d1\u73b0\u65b0\u7248\u672c\uff1a" + d.latest + "\n\u5f53\u524d\uff1a" + (d.cur && d.cur.name))
+                        : ("\u5df2\u662f\u6700\u65b0\u7248\uff08" + d.latest + "\uff09"));
+                } else {
+                    alert((d.title || "\u68c0\u67e5\u5931\u8d25") + "\n\n" + (d.body || ""));
+                }
+            } catch (e2) {}
+        }
+    }
+
     function installUpdateChecker() {
       if (window.__dshUpdateChecker) return;
       window.__dshUpdateChecker = true;
@@ -2569,38 +2903,13 @@ html[data-dsh-seat-tray="open"] #dsh-st-panel { display: flex; }
       var tries = 0;
       var timer = setInterval(function () {
         tries++;
-        if (window.__DSH_APP_VERSION) { clearInterval(timer); doUpdateCheck(); }
-        else if (tries > 40) clearInterval(timer);   /* 20 秒拿不到说明是普通浏览器，不显示更新入口 */
+        /* ★ 2026-10-20：原来这里会自动跑一次 doUpdateCheck()（读 /dsh-version.json）。
+         * 现在改成**只探测版本号**，不自动检查、不自动弹窗 ——
+         * 用户要的是「菜单里有个检查更新，点了才查」。
+         * 自动弹出的更新提示在手机上很烦人（用户明确讨厌被打断）。 */
+        if (window.__DSH_APP_VERSION) { clearInterval(timer); }
+        else if (tries > 40) clearInterval(timer);   /* 20 秒拿不到说明是普通浏览器 */
       }, 500);
-    }
-
-    function doUpdateCheck() {
-      try {
-        fetch("/dsh-version.json", { cache: "no-store" })
-          .then(function (r) { return r.ok ? r.json() : null; })
-          .then(function (d) {
-            if (!d || !d.versionCode) return;
-            var cur = window.__DSH_APP_VERSION || 0;
-            if (d.versionCode <= cur) return;
-            mountUpdateButton(cur, d);
-          })
-          .catch(function () {});
-      } catch (e) {}
-    }
-
-    function mountUpdateButton(cur, d) {
-      if (document.getElementById("dsh-mobile-update")) return;
-      var b = document.createElement("button");
-      b.id = "dsh-mobile-update";
-      b.type = "button";
-      b.textContent = "\u2b06\ufe0f \u65b0\u7248\u672c " + d.versionName
-        + "\uff08\u5f53\u524d " + (window.__DSH_APP_VERSION_NAME || cur) + "\uff09\u70b9\u51fb\u66f4\u65b0";
-      b.addEventListener("click", function (ev) {
-        ev.preventDefault(); ev.stopPropagation();
-        b.textContent = "\u23f3 \u6b63\u5728\u4e0b\u8f7d\u66f4\u65b0\u2026";
-        location.href = "/dsh-update.apk";   /* App 的 DownloadListener 会接管并拉起安装器 */
-      });
-      document.body.appendChild(b);
     }
 
     /* ========== 右栏状态同步（原「余额胶囊」逻辑的遗存骨架） ==========
@@ -3521,7 +3830,14 @@ html[data-dsh-seat-tray="open"] #dsh-st-panel { display: flex; }
            否则官方的「Agent 预设」「后台任务」会被藏掉却没人搬进菜单 ⇒ **两处都看不见**。
            已用 html[data-dsh-menu-inject="1"] 作为开关前缀（见 CSS 段）。
            下面 ④ 里会显式移除该属性。 */
-      /* feature("menuInjector", installMenuInjector); */
+      /* ★★★ 2026-10-20：**重新启用**（用户「单独说」要加检查更新）。
+       *
+       *   2026-10-19 停用它是因为用户要求「⋮ 菜单清空所有非官方注入项」。
+       *   现在按用户 2026-10-20 的新要求恢复，但 `want[]` 里**只剩「检查更新」一项**
+       *   （见 injectMenuItems 里那段注释），其余 15 项仍然不注入。
+       *
+       * ★ 若哪天又要把菜单恢复成纯官方：把这一行注释掉即可（原样保留这个回退口）。 */
+      feature("menuInjector", installMenuInjector);
       /* ★ 2026-10-07（任务 m02710）：回前台秒回 —— 页面重新可见时把官方连接层的
          重试退避清零。纯监听 + 调官方 reconnect()，不碰界面、不改 DOM。
          放在这一批里有讲究：它不依赖 layout，取不到 connection 服务时也只是静默待命。 */

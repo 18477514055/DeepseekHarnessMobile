@@ -181,6 +181,23 @@ public class DshService extends Service {
                 Cfg.log(this, "⚠️ pnpm 配置修正失败（不影响启动）: " + t);
             }
 
+            /* ★★★ 2026-10-20（用户要求）：移动端环境补齐。
+             *
+             * 做三件事（详见 MobileEnvSetup 的类注释）：
+             *   ① 预建默认工作区目录
+             *   ② 写**家级** patch（`$DSH_HOME/cordis.patch.yml`）补 documentsDirectory
+             *      —— 官方会调 `xdg-user-dir DOCUMENTS`，而容器里没有这个命令
+             *         ⇒ 首启必报「无法创建默认工作区」
+             *   ③ 装内置 AGENTS.md，让模型一上来就懂环境限制
+             *
+             * ★ 必须**在容器启动之前**做：profile patch 要在 dsh 读取配置前就位。
+             * ★ 全程 try/catch，失败只记日志 —— 报告明确要求「不要阻断启动」。 */
+            try {
+                MobileEnvSetup.prepare(this);
+            } catch (Throwable t) {
+                Cfg.log(this, "⚠️ 移动端环境初始化失败（不影响启动）: " + t);
+            }
+
             setStatus("启动容器…");
             java.util.List<String> cmd = ProotLauncher.buildCommand(this);
             Cfg.log(this, "cmd = " + String.join(" ", cmd));
@@ -300,6 +317,15 @@ public class DshService extends Service {
                 if (token != null && !token.isEmpty()) {
                     readyUrl = "http://127.0.0.1:" + Cfg.PORT + "/?token=" + token;
                     Cfg.log(this, "就绪，token 已取到");
+
+            /* ★ 2026-10-20（验收）：DSH 内核此时已经读完配置并可能建过工作区，
+             *   把关键文件的实际状态打进 boot.log。
+             *   为什么在这里：release 包没有任何别的通道能读到 app 私有目录里的这些文件。 */
+            try {
+                MobileEnvSetup.dumpState(this);
+            } catch (Throwable t) {
+                Cfg.log(this, "[验收] dumpState 失败（不影响运行）: " + t);
+            }
                 } else {
                     /* ★★★ 2026-10-20：**绝不能用空 token 加载页面**。
                        踩过（用户报「主界面已经出现了，但各项功能始终不能用」）：

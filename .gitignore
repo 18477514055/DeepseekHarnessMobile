@@ -49,3 +49,9 @@ _*.js
 #      （.gitignore 管不到 APK 打包，所以这条只是双保险；物理上别放这儿）
 android/app/src/main/assets/*.bak-*
 android/app/src/main/assets/*.tmp
+# ---- 手机端报告（本机材料，不入库）----
+_手机报告-*/
+# ---- 临时测试页与探针脚本 ----
+_wv*.html
+t-*.cjs
+_rel*.md
