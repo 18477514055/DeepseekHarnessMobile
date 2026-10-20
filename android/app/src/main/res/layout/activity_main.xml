@@ -2,22 +2,42 @@
 <!-- ★ 2026-10-20：启动页改为**浅色**（用户：「启动页面改浅色的吧，深色的不好看」）。
      配色对齐官方 web 前端的浅色主题：
        背景 #FFFFFF / 主文字 #1A1A1A / 次要 #6B7280 / 进度条用官方品牌蓝 #4D6BFE
-     ★ 鲸鱼图标用官方 favicon 的矢量路径（ic_whale.xml），黑色填充在浅底上清晰。 -->
-<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+     ★ 鲸鱼图标用官方 favicon 的矢量路径（ic_whale.xml），黑色填充在浅底上清晰。
+
+     ★★★ 2026-10-20（修「7~8 秒黑屏」）：
+     原来是 LinearLayout 竖排，splash 与 webWrap 是**兄弟节点**——
+     只要 splash 占满全屏，webWrap 就被挤到屏幕下方之外。
+     想让启动页「压在上面」直到页面真的开始画，必须是**叠层（FrameLayout）**：
+       WebView 先就位、在底层；splash 覆盖在上层；reveal 时只把 splash 设 GONE。
+     为什么必须这样：实测 showWeb → onPageStarted 之间要 8~9 秒
+     （WebView 渲染进程冷启动），旧顺序先把 splash 撤了 ⇒ 这 8~9 秒全黑。 -->
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
-    android:orientation="vertical"
     android:background="#FFFFFFFF"
     android:fitsSystemWindows="true">
 
-    <!-- 启动 / 解压进度页 -->
+    <!-- 主界面：WebView（★ 底层，从一开始就 VISIBLE，让渲染进程尽早开始初始化） -->
+    <FrameLayout
+        android:id="@+id/webWrap"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent">
+
+        <WebView
+            android:id="@+id/webView"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent" />
+    </FrameLayout>
+
+    <!-- 启动 / 解压进度页（★ 覆盖在 WebView 之上，直到页面真的开始加载） -->
     <LinearLayout
         android:id="@+id/splash"
         android:layout_width="match_parent"
         android:layout_height="match_parent"
         android:orientation="vertical"
         android:gravity="center"
-        android:padding="32dp">
+        android:padding="32dp"
+        android:background="#FFFFFFFF">
 
         <!-- 官方鲸鱼图标 -->
         <ImageView
@@ -66,17 +86,4 @@
             android:textColor="#FF9CA3AF"
             android:textSize="12sp" />
     </LinearLayout>
-
-    <!-- 主界面：WebView -->
-    <FrameLayout
-        android:id="@+id/webWrap"
-        android:layout_width="match_parent"
-        android:layout_height="match_parent"
-        android:visibility="gone">
-
-        <WebView
-            android:id="@+id/webView"
-            android:layout_width="match_parent"
-            android:layout_height="match_parent" />
-    </FrameLayout>
-</LinearLayout>
+</FrameLayout>
