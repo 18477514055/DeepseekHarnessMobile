@@ -96,6 +96,23 @@ public class MainActivity extends AppCompatActivity {
             public void onPageStarted(WebView v, String url, android.graphics.Bitmap fav) {
                 Cfg.log(MainActivity.this,
                         "PAGE_START url=" + url.replaceAll("token=[^&]+", "token=***"));
+
+                /* ★★★ 2026-10-20（修「检查更新永远查不出新版本」）：
+                   插件的 currentVersion() 读 window.__DSH_APP_VERSION /
+                   __DSH_APP_VERSION_NAME，但**整个 Android 侧从来没有注入过这两个变量**。
+                   后果链（已逐行核对，不是推测）：
+                     currentVersion() → { code: 0, name: "?" }
+                     parseVer("?")    → null（匹配不到 \d+\.\d+\.\d+）
+                     newer            → 永远 false
+                   ⇒ 无论远端发到哪一版，都只会显示「当前版本号读不到，无法自动判断」，
+                     **「发现新版本」那条路径从来没被走到过**。
+                   所以 1.0.3 时期「检查更新」被验证为可用，实际上只验到了"菜单项可见"。
+
+                   为什么注入点选 onPageStarted：此时文档已开始执行脚本、但页面里的
+                   JS（含插件）还没跑完，注入的全局变量能被插件读到。
+                   ★ 用 evaluateJavascript 而不是 addJavascriptInterface：
+                     后者会把一个 Java 对象暴露给任意页面脚本，是已知的高危面。 */
+                injectAppVersion();
                 /* ★★★ 2026-10-20：**到这一刻才撤启动页**。
                    为什么：原来是 showWeb 里先 splash.GONE 再 loadUrl，
                    而 WebView 从 loadUrl 到真正发出请求要 8~9 秒（渲染进程冷启动），
@@ -359,6 +376,48 @@ public class MainActivity extends AppCompatActivity {
                 splash.setVisibility(View.GONE);
                 Cfg.log(this, "revealWeb 已撤启动页（t=" + System.currentTimeMillis() + "）");
             }
+        });
+    }
+
+    /* ★★★ 2026-10-20（修「检查更新永远查不出新版本」）：
+       把 App 的真实 versionCode / versionName 注入页面全局变量，
+       供插件 currentVersion() 读取与比较。
+
+       为什么必须做：插件的检查更新靠 `parseVer(window.__DSH_APP_VERSION_NAME)`
+       得到"当前版本"，而这两个变量此前**没有任何代码注入** ⇒ name 回退成 "?"、
+       parseVer 返回 null、newer 恒为 false ⇒ 「发现新版本」永远走不到。
+
+       ★ 版本号来源用 PackageManager 而不是 BuildConfig：
+         这样连 flavor / 构建类型都不必关心，读到的就是最终打进 APK 的那个值
+         （也就是系统「应用信息」里显示的那个），不会和实际安装包对不上。
+       ★ 注入失败必须记日志 —— 它一坏，检查更新就静默退回"读不到版本"。 */
+    private void injectAppVersion() {
+        int code = 0;
+        String name = "";
+        try {
+            android.content.pm.PackageInfo pi =
+                    getPackageManager().getPackageInfo(getPackageName(), 0);
+            code = (android.os.Build.VERSION.SDK_INT >= 28)
+                    ? (int) pi.getLongVersionCode() : pi.versionCode;
+            name = (pi.versionName == null) ? "" : pi.versionName;
+        } catch (Exception e) {
+            Cfg.log(this, "[版本注入] 读 PackageInfo 失败: " + e);
+        }
+        /* JSON 里字符串必须转义 —— 版本号理论上不会有引号，但不能假设，
+           因为一旦注入的 JS 语法错，整个 evaluateJavascript 静默失败。 */
+        /* ★ 这两个必须是 final：下面的 evaluateJavascript 回调是 lambda，
+           它只能捕获 effectively-final 的局部变量，而 code/name 在 try 里被赋过值。 */
+        final int vCode = code;
+        final String vName = name;
+        String safeName = vName.replace("\\", "\\\\").replace("'", "\\'");
+        String js = "(function(){try{"
+                + "window.__DSH_APP_VERSION=" + vCode + ";"
+                + "window.__DSH_APP_VERSION_NAME='" + safeName + "';"
+                + "return '" + vCode + "|" + safeName + "';"
+                + "}catch(e){return 'ERR:'+e}})()";
+        webView.evaluateJavascript(js, value -> {
+            Cfg.log(this, "[版本注入] __DSH_APP_VERSION=" + vCode
+                    + " __DSH_APP_VERSION_NAME=" + vName + " ⇒ " + value);
         });
     }
 
