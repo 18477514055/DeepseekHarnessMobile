@@ -1,5 +1,21 @@
 # 自包含 APK · 实证报告（2026-10-19）
 
+> **本文是 2026-10-19 的可行性取证报告，保留原文不改。**
+> 它回答一个问题：**「能不能不装 Termux 也把 DSH 跑进 APK」** —— 答案是能。
+>
+> 下面这些结论**至今仍然成立**，没有被推翻：
+> - proot 必须从 `nativeLibraryDir` 执行（`apk_data_file` 可 exec）
+> - rootfs 必须留在 `/data/data/`（501 个符号链接，`/sdcard` 不支持 POSIX symlink）
+> - targetSdk 必须 ≤ 28（SELinux `neverallow` 豁免）
+> - `sysdata` 那 10 个伪造文件是硬需求
+>
+> 但**文末「剩下的全是工程活」那一段已经做完了**：Android 工程、assets 打包、
+> 首启解压、jniLibs 五件套、前台服务、WebView 改 `Runtime.exec()` —— 全部落地，
+> 并在三台设备上验证过（1.0.3）。
+>
+> ★ 当前状态以 **[LEDGER.md](../LEDGER.md)** 为准；构建方式见
+> **[06-构建资产清单](06-构建资产清单.md)**。
+
 > 这份文档是 `LEDGER.md` 的详细附件 —— 台账只留摘要，过程与全部实测数据在这里。
 > 对应台账章节：§十四。
 
