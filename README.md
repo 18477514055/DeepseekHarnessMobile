@@ -73,11 +73,15 @@ build.cmd release    :: release APK
 
 | 文件 | 大小 | 说明 |
 |---|---|---|
-| `android/app/src/main/assets/rootfs.gz.bin` | ~392 MB | Debian rootfs（gzip） |
-| `android/app/src/main/assets/pnpm-incr.gz.bin` | ~23 MB | pnpm 二进制增量包 |
-| `android/app/src/main/assets/mobile-adapt.gz.bin` | ~76 KB | 内置移动端插件（由 `_pk.cjs` 生成） |
+| `android/app/src/main/assets/rootfs.gz.bin` | 376 MB（394,325,574 B） | Debian rootfs（gzip），解压后 82,392 个条目 |
+| `android/app/src/main/assets/pnpm-incr.gz.bin` | 22.1 MB（23,219,739 B） | pnpm 二进制增量包 |
+| `android/app/src/main/assets/mobile-adapt.gz.bin` | 123 KB（125,811 B） | 内置移动端插件（由 `_pk.cjs` 生成） |
+| `android/app/src/main/assets/使用指南.md` | 8.3 KB | 随包分发的使用指南，启动时复制到共享目录 |
 
-★ 后缀是 `.gz.bin` 而不是 `.gz` —— **AGP 会自动解压 `.gz`**，把 374 MB 变成 1.3 GB。
+★ 后缀是 `.gz.bin` 而不是 `.gz` —— **AGP 会自动解压 `.gz`**，把 376 MB 变成 1.3 GB。
+★ 三个大资产**不进版本库**（见 `.gitignore`）。仅凭仓库无法直接构建出 APK ——
+需要先按 **[docs/06-构建资产清单.md](docs/06-构建资产清单.md)** 取到这三个文件并校验 SHA-256。
+那里面写清了两条途径（从已发布 APK 里解出 / 自己生成）、确切字节数、以及一个可直接跑的校验脚本。
 
 ### 本机路径
 
@@ -110,8 +114,12 @@ docs/                  实证报告与工程说明
 
 - **不上架**：targetSdk=28 是硬约束。
 - **不做开机自启**：Android 会因此限制应用（这是刻意设计），改为「点开后常驻」。
-- **首次启动慢**：要解压 ~392 MB rootfs，约 30~60 秒。
+- **首次启动慢**：要解压 376 MB rootfs。实测从进程启动到页面可用为 **94~107 秒**
+  （Android 15 / OPPO PHW110；两次测量分别是升级后首启 106.8 秒、纯重启 94.0 秒）。
+  启动期间界面停在启动页，属正常现象。
 - **仅 arm64-v8a**。
+- **需要较新的 WebView**：界面使用 Chrome 85+ 语法，系统 WebView 低于 85 会白屏
+  （详见 `使用指南.md` 第 5 节）。
 
 ## License
 
