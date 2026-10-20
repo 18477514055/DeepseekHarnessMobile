@@ -180,7 +180,17 @@ final class RootfsInstaller {
         try {
             //noinspection ResultOfMethodCallIgnored
             f.delete();
-            Files.createSymbolicLink(f.toPath(), Path.of(target));
+            /* ★★★ 2026-10-20（真机崩溃后修）：这里原来是 `Path.of(target)`。
+             *
+             * `Path.of(String, String...)` 是 **Java 11** 的 API，Android 上直到
+             * **API 33** 才提供。在 Android 10（API 29）上直接抛：
+             *   java.lang.NoSuchMethodError: No static method of(...)Ljava/nio/file/Path;
+             * ⇒ App 启动即崩（解压走不到符号链接那一步就死）。
+             *
+             * `File.toPath()` 从 API 1 就有，且语义等价（相对路径同样按 cwd 解析）。
+             * ★ 编译期不会报错（JDK 里有这个 API），**只有低版本真机才会暴露** ——
+             *   这就是为什么自家 Android 16 的设备测不出来。 */
+            Files.createSymbolicLink(f.toPath(), new File(target).toPath());
         } catch (Exception ex) {
             Cfg.log(c, "建链接失败 " + name + ": " + ex.getMessage());
         }
@@ -213,7 +223,7 @@ final class RootfsInstaller {
      * 而 APK 升级时插件源码可能已经换了 ⇒ 不重装就还是旧的。
      * 踩过：改完 bug 出了新包，装上却还是老行为，因为判定"已装好"直接跳过了。
      */
-    static final int ADAPT_BUILD = 28;
+    static final int ADAPT_BUILD = 31;
     static final String ADAPT_STAMP = ".adapt-build";
 
     static File adaptDir(Context c) { return new File(Cfg.rootfs(c), ADAPT_DIR); }
@@ -1382,7 +1392,11 @@ final class RootfsInstaller {
                 //noinspection ResultOfMethodCallIgnored
                 out.delete(); // 已存在就替换（重复安装场景）
                 Path link = out.toPath();
-                Files.createSymbolicLink(link, Path.of(e.linkName));
+                /* ★★★ 2026-10-20（真机崩溃后修，与 link() 同一根因）：
+                 * `Path.of(...)` 是 Java 11 API，Android 到 API 33 才有。
+                 * Android 10 上抛 NoSuchMethodError ⇒ **首启解压直接崩**。
+                 * 改用 `new File(...).toPath()`（API 1 起就有）。 */
+                Files.createSymbolicLink(link, new File(e.linkName).toPath());
                 return;
             }
 
