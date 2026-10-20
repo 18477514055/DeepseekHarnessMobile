@@ -213,7 +213,7 @@ final class RootfsInstaller {
      * 而 APK 升级时插件源码可能已经换了 ⇒ 不重装就还是旧的。
      * 踩过：改完 bug 出了新包，装上却还是老行为，因为判定"已装好"直接跳过了。
      */
-    static final int ADAPT_BUILD = 17;
+    static final int ADAPT_BUILD = 28;
     static final String ADAPT_STAMP = ".adapt-build";
 
     static File adaptDir(Context c) { return new File(Cfg.rootfs(c), ADAPT_DIR); }
@@ -624,6 +624,53 @@ final class RootfsInstaller {
                     + " (package.json + lib/client.js + lib/index.js + cordis.patch.yml)");
         } catch (Exception ex) {
             Cfg.log(c, "❌ 复制插件到 node_modules 失败: " + ex);
+        }
+
+        installAndroidBridgeCli(c, target);
+    }
+
+    /* ★★★ 2026-10-20：把容器内的 `dsh-android` 命令装到 PATH 上。
+     *
+     * 做什么：
+     *   · 从插件目录里的 `android-bridge/dsh-android.js` 取脚本
+     *   · 在 `/opt/node/bin/dsh-android` 写一个 sh 包装器（node 执行它）
+     *   · chmod +x
+     *
+     * 为什么放 /opt/node/bin：那里**本来就在 PATH 里**
+     *   （ProotLauncher 的 PATH 含 /opt/node/bin），且是 rootfs 内
+     *   真实可写目录（不像 /sdcard 是 FUSE、chmod +x 不生效）。
+     *
+     * ★ 失败不影响插件本身 —— 只是没有 Android 能力。 */
+    private static void installAndroidBridgeCli(Context c, File pluginDir) {
+        try {
+            File src = new File(pluginDir, "android-bridge/dsh-android.js");
+            if (!src.exists()) {
+                Cfg.log(c, "android-bridge 脚本不存在，跳过 CLI 安装");
+                return;
+            }
+            File binDir = new File(Cfg.rootfs(c), "opt/node/bin");
+            if (!binDir.exists()) binDir.mkdirs();
+
+            // 脚本本体放到 node_modules 之外，避免被插件更新覆盖
+            File home = new File(Cfg.rootfs(c), "root/.dsh-android");
+            if (!home.exists()) home.mkdirs();
+            File js = new File(home, "dsh-android.js");
+            Files.copy(src.toPath(), js.toPath(),
+                    java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+
+            // 包装器：用绝对路径调 node，避免依赖 PATH
+            File sh = new File(binDir, "dsh-android");
+            writeText(sh, "#!/bin/sh\n"
+                    + "exec /opt/node/bin/node /root/.dsh-android/dsh-android.js \"$@\"\n");
+            //noinspection ResultOfMethodCallIgnored
+            sh.setExecutable(true, false);
+            //noinspection ResultOfMethodCallIgnored
+            sh.setReadable(true, false);
+
+            Cfg.log(c, "已安装 Android 桥 CLI: " + sh.getAbsolutePath()
+                    + "（executable=" + sh.canExecute() + "）");
+        } catch (Throwable t) {
+            Cfg.log(c, "⚠️ 安装 Android 桥 CLI 失败: " + t);
         }
     }
 

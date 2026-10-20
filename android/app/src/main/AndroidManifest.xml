@@ -27,6 +27,37 @@
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
 
     <!--
+      ★★★ 2026-10-20：Android 能力桥需要的权限（对应 dsh-android 的相机/定位命令）
+
+      ★ 这些都是**运行时权限**，装上时不会自动授予；用户第一次用到相关命令时
+        我们会告诉他「需要哪个权限 + 一条命令直接跳到那一页」
+        （见 Perms.java，用户明确要求：引导用户跳到相关页面，而不是让他自己找）。
+
+      ★ 声明在这里是为了让系统设置页能显示这些开关 —— 不声明的话，
+        用户连"去哪里开"都看不到。
+    -->
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+
+    <!--
+      ★★★ 2026-10-20（用户报「无法在权限页面找到打开麦克风的权限」）：
+
+      **必须先在 Manifest 里声明，系统设置页才会出现这个开关。**
+      没声明就是「这个 App 从来不申请该权限」，应用详情页里根本不会有这一项 ——
+      这解释了为什么用户找不到。
+
+      ★ 注意：声明 ≠ 自动授予。运行时仍要用户点允许，
+        我们会用 Perms.open() 跳到对应页。
+      ★ 加 RECORD_AUDIO 会让部分应用商店/安全检测标记为"需要麦克风"，
+        但本项目走侧载，且麦克风是 dsh-android 的能力之一（语音输入场景），
+        声明它是诚实的做法 —— 不声明却声称有能力才是问题。
+    -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+
+
+
+    <!--
       ★★★ 2026-10-19：MANAGE_EXTERNAL_STORAGE（所有文件访问）
 
       ★ 我一开始判断错了：以为它"要求 targetSdk>=30，所以 targetSdk=28 拿不到"。

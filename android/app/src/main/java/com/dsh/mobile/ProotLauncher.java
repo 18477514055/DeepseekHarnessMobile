@@ -120,6 +120,30 @@ final class ProotLauncher {
         cmd.add("--bind=" + Cfg.prootPathOf(new File(sd, "stat")) + ":/proc/stat");
         cmd.add("--bind=" + Cfg.prootPathOf(new File(sd, "uptime")) + ":/proc/uptime");
         cmd.add("--bind=" + Cfg.prootPathOf(new File(sd, "version")) + ":/proc/version");
+        /* ★★★ 2026-10-20（据环境勘察报告 P0）：补上 overflowuid / overflowgid。
+         *
+         * 报告实测：DSH 的 `workspace-write` 沙箱**完全不可用**，只能降级成
+         * danger-full-access + 审批全关（等于没有安全边界）。
+         * 排查结论是 bubblewrap 起不来：
+         *   bwrap: Can't read /proc/sys/kernel/overflowuid: Permission denied
+         * 根因：宿主 hidepid=invisible + proot 没有伪造这两个文件。
+         *
+         * ⇒ 这两个文件 Sysdata.ensure() **早就生成了**
+         *   （sysctl_kernel_overflowuid / sysctl_kernel_overflowgid），
+         *   只是从来没 bind 进容器 —— 补上这两行即可。
+         *
+         * ★ 注意：能否真正恢复沙箱，取决于 bwrap 还需不需要别的 /proc 文件；
+         *   报告给的验收命令是：
+         *     bwrap --ro-bind / / --dev /dev --proc /proc echo ok
+         *   若仍不行，退路是把默认沙箱模式设成 danger-full-access 并在 UI 明示。 */
+        File ouid = new File(sd, "sysctl_kernel_overflowuid");
+        File ogid = new File(sd, "sysctl_kernel_overflowgid");
+        if (ouid.exists()) {
+            cmd.add("--bind=" + Cfg.prootPathOf(ouid) + ":/proc/sys/kernel/overflowuid");
+        }
+        if (ogid.exists()) {
+            cmd.add("--bind=" + Cfg.prootPathOf(ogid) + ":/proc/sys/kernel/overflowgid");
+        }
 
         // ---- 用户数据：bind 进容器，卸载重装可保留 ----
         cmd.add("--bind=" + Cfg.prootPathOf(Cfg.dshHome(c)) + ":/root/.dsh");
@@ -190,7 +214,17 @@ final class ProotLauncher {
     static void applyEnv(ProcessBuilder pb, Context c) {
         java.util.Map<String, String> env = pb.environment();
         env.clear();
-        env.put("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
+        /* ★★★ 2026-10-20：PATH **必须含 /opt/node/bin**。
+         *
+         * 踩过：这里原来只写了标准 Debian 路径，而 node / pnpm / dsh-android
+         * 都在 `/opt/node/bin` —— 主容器靠启动命令里那句
+         *   `export PATH=/opt/node/bin:$PATH`
+         * 临时救回来了，但**我们另起的临时 proot 没有那句话** ⇒
+         * 容器内 `command -v dsh-android` 报 BRIDGE_CLI_MISSING，
+         * 明明文件就在那儿且 executable=true。
+         * ⇒ 统一放进 applyEnv，两条路径都覆盖。 */
+        env.put("PATH", "/opt/node/bin:/usr/local/sbin:/usr/local/bin:"
+                + "/usr/sbin:/usr/bin:/sbin:/bin");
         env.put("HOME", "/root");
         env.put("USER", "root");
         env.put("TERM", "dumb");
@@ -202,6 +236,22 @@ final class ProotLauncher {
         env.put("LD_LIBRARY_PATH", Cfg.prootPathOf(Cfg.libDir(c)));
         // lingshu-bridge 要 spawn python3（§14.4）
         env.put("MDCG_PYTHON", "python3");
+
+        /* ★★★ 2026-10-20（据环境勘察报告 P6）：**设置时区**。
+         *
+         * 报告实测：容器内 TZ 未设 ⇒ 所有日志与 `date` 都是 UTC，
+         * 与用户在手机上看的时间差 8 小时，排障时极易看错时间线
+         * （我自己排查 token 那件事时就被 UTC 时间坑过）。
+         *
+         * 做法：从 Android 系统读真实时区（TimeZone.getDefault()），
+         * 传进容器。取不到就退回 Asia/Shanghai（本机设备在国内）。
+         * ★ 同时设 TZ 与用户级时区，让 date/node/python 都一致。 */
+        String tz = null;
+        try {
+            tz = java.util.TimeZone.getDefault().getID();
+        } catch (Throwable ignored) { }
+        if (tz == null || tz.isEmpty() || "GMT".equals(tz)) tz = "Asia/Shanghai";
+        env.put("TZ", tz);
     }
 
     private static void copy(File src, File dst) throws IOException {
