@@ -1,7 +1,7 @@
-﻿const fs=require('fs'),path=require('path'),zlib=require('zlib');
+const fs=require('fs'),path=require('path'),zlib=require('zlib');
 const SRC='_plugin-src';
 const OUT='android/app/src/main/assets/mobile-adapt.gz.bin';
-const ALLOW=['lib','package.json','cordis.patch.yml','README.md'];
+const ALLOW=['lib','package.json','cordis.patch.yml','README.md','android-bridge'];
 const entries=[{name:'plugin-src/',mode:0o755,data:null}];
 function walk(abs, rel){
   const st=fs.lstatSync(abs);

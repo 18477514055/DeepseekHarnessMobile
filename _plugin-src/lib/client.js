@@ -480,11 +480,45 @@ html[data-dsh-seat-tray="open"] #dsh-st-panel { display: flex; }
          · 不调用任何自定义函数（只用 DOM API 与内建）
          · 全程 try/catch，出错也绝不向外抛
          · 放在主逻辑**之外**，不夹在赋值语句中间 */
+    /* ★★★ 2026-10-20（据环境勘察报告 P3）：诊断日志**默认关闭**。
+     *
+     * 报告实测：web.log 里 `[DSH-DIAG]` 占 **2087/3503 行 = 60%**，
+     * 而且**无轮转、随使用无限增长**（当时已 1.6 MB）。
+     * 每次触摸会打 2~3 行（touch.mode / touch.end / touch.skip.*），
+     * 正常使用一天就能刷出几 MB —— 既污染排障现场，也白占手机存储。
+     *
+     * 打开方式（三种任一，都不需要改代码）：
+     *   · URL 加 `?dshdiag=1`
+     *   · localStorage.setItem('dshDiag', '1')
+     *   · 全局 `window.__dshDiag = true`
+     *
+     * ★ 只影响"要不要打印"，不影响任何逻辑 —— diagLog 本来就全程 try/catch、
+     *   无副作用，关掉它不会改变行为。 */
+    var _diagOn = null;
+    function diagEnabled() {
+      if (_diagOn !== null) return _diagOn;
+      try {
+        if (window.__dshDiag === true) { _diagOn = true; return true; }
+        if (/[?&]dshdiag=1\b/.test(location.search || "")) {
+          _diagOn = true;
+          try { localStorage.setItem("dshDiag", "1"); } catch (e) {}
+          return true;
+        }
+        _diagOn = (localStorage.getItem("dshDiag") === "1");
+      } catch (e) {
+        _diagOn = false;
+      }
+      return _diagOn;
+    }
+
     function diagLog(tag, obj) {
       try {
+        if (!diagEnabled()) return;                /* ★ 默认静默 */
         console.log("[DSH-DIAG] " + tag + " " + JSON.stringify(obj === undefined ? null : obj));
       } catch (e) {
-        try { console.log("[DSH-DIAG] " + tag + " <unserializable>"); } catch (e2) {}
+        try {
+          if (diagEnabled()) console.log("[DSH-DIAG] " + tag + " <unserializable>");
+        } catch (e2) {}
       }
     }
 
@@ -4840,6 +4874,890 @@ html[data-dsh-seat-tray="open"] #dsh-st-panel { display: flex; }
       })();
       }
     }
+
+
+    /* ==================================================================
+     * ★★★ 2026-10-20：API 设置页（从 api-settings.js 合并而来）
+     * 用户要求：在设置面板里加一项「API 设置」，集中管理权限与 ADB，
+     * 并能自动同步用户在系统设置里改过的权限状态。
+     * ================================================================== */
+/* ==========================================================================
+ * ★★★ 2026-10-20：API 设置页（用户要求）
+ *
+ * 用户原话：
+ *   「可以把我们的这些增加的设置全部作为一个单独的出现在 Dsh 客户端内部的
+ *     权限页面，可以放在那个设置面板里，作为一项可以名叫 API 设置，
+ *     然后在里面调整设置的时候，自动引导用户跳转相关页面进行权限开启，
+ *     如果检测到用户已经自行开启的，则 API 设置页面也自行同步。
+ *     包括 adb 设置也可以放在这里。」
+ *
+ * ══════════════════════════════════════════════════════════════════
+ * 设计要点
+ * ══════════════════════════════════════════════════════════════════
+ * ① **不改官方 DOM 结构**：只在官方设置面板的 nav 列表末尾**追加一项**
+ *    「API 设置」，点它时把 content 区替换成我们自己的内容。
+ *    ★ 官方一改版、我们最多是"没这个入口"，绝不会把设置面板弄坏。
+ *
+ * ② **状态自动同步**：页面里每 1.5 秒（仅当页面可见时）向 APK 拉一次
+ *    `dsh-android perms`，用户在系统设置里开了权限、切回来立刻就能看到勾。
+ *    ★ 用户明确要求「检测到用户已经自行开启的，则 API 设置页面也自行同步」。
+ *
+ * ③ **每项都能一键跳转**：点「去开启」→ 调 `openperms <name>`，
+ *    由 APK 侧直接跳到**对应那一页**（不是笼统的设置首页）。
+ *
+ * ④ **ADB 三档开关**放在同一页，切到 full 需要二次确认（与 AdbBridge 一致）。
+ *
+ * ══════════════════════════════════════════════════════════════════
+ * 数据来源
+ * ══════════════════════════════════════════════════════════════════
+ * 全部经由 `dsh-android` CLI（容器内的 Node 客户端）→ 抽象 socket → APK。
+ * 但**浏览器端不能直接跑 shell**，所以要经过服务端半（lib/index.js）
+ * 暴露的 HTTP 路由转发。路由名：`/dsh-mobile/api/<cmd>`。
+ *
+ * ★ 若服务端路由不可用（老内核 / 插件没重启），页面会显示"桥不可用"，
+ *   并给出手动命令，而不是假装能用。
+ * ========================================================================== */
+(function () {
+  'use strict';
+
+  var FLAG = '__dshMobileApiSettings';
+  if (window[FLAG]) return;
+  window[FLAG] = true;
+
+  var POLL_MS = 1500;
+  var POLL_MAX_MS = 30000;   // ★ 退避上限
+  var pollTimer = null;
+  var pollDelay = POLL_MS;
+  var failStreak = 0;
+  var busyUntil = 0;         // 长任务（apt 安装）期间，轮询暂停到这个时刻
+  var busyHint = '';
+  var panelEl = null;       // 我们自己渲染的内容根
+  var lastPerms = null;
+  var lastAdb = null;
+  var staleErr = '';        // 连续失败时的说明（不清空已有数据）
+
+  /* ---------------- 与容器通信 ---------------- */
+
+  /** 拿服务端原始 JSON（不抛错，交给调用方判断 ok/busy）。 */
+  function callRaw(cmd, args) {
+    var url = '/dsh-mobile/api/' + encodeURIComponent(cmd);
+    if (args) url += '?args=' + encodeURIComponent(args);
+    return fetch(url, { credentials: 'same-origin' })
+      .then(function (r) {
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        return r.json();
+      });
+  }
+
+  /** 把 `{ok:true,data:"<字符串>"}` 里的 data 解析成对象/字符串。 */
+  function parseData(d) {
+    if (typeof d === 'string') {
+      var s = d.trim();
+      if (s.charAt(0) === '{' || s.charAt(0) === '[') {
+        try { return JSON.parse(s); } catch (e) { return d; }
+      }
+    }
+    return d;
+  }
+
+  /** 调服务端半的路由（服务端会用 dsh-android 转发给 APK）。失败即抛错。 */
+  function call(cmd, args) {
+    return callRaw(cmd, args).then(function (j) {
+      if (!j || j.ok !== true) throw new Error((j && j.error) || '桥返回失败');
+      /* ★★★ 2026-10-20 修（用户报「似乎没有同步我已经开启的权限」）：
+       *
+       * 服务端返回的是 `{ ok:true, data:"<CLI 的原始标准输出>" }` ——
+       * `data` 是**字符串**，不是对象！
+       * 上一版直接 `return j.data`，于是 `lastPerms` 拿到的是字符串，
+       * `lastPerms['allFiles']` 永远是 undefined ⇒ **所有权限都显示"未开启"**
+       * ⇒ 用户明明开了"所有文件访问"，页面还是不勾。
+       *
+       * ⇒ 这里要把 JSON 形态的输出解析成对象。
+       *   解析失败就原样返回字符串（有些命令返回的不是 JSON，比如 ping）。 */
+      return parseData(j.data);
+    });
+  }
+
+  /* ---------------- 页面数据模型 ---------------- */
+
+  /**
+   * 权限项定义。`key` 与 APK 的 `perms` JSON 字段对应；
+   * `perm` 是 openperms 的名字（跳到哪一页由 APK 决定）。
+   */
+  var PERM_ITEMS = [
+    { key: 'allFiles', name: '所有文件访问', perm: 'allfiles',
+      desc: '让 DSH 能读写手机存储里的任意文件（工作区互通）' },
+    { key: 'camera', name: '相机', perm: 'app',
+      desc: '拍照 / 扫码（暂未启用界面调用）' },
+    { key: 'location', name: '定位', perm: 'app',
+      desc: '读取最近一次位置（不主动持续定位）' },
+    { key: 'recordAudio', name: '麦克风', perm: 'app',
+      desc: '录音（暂未启用）' },
+    { key: 'storage', name: '存储读取', perm: 'app',
+      desc: '读取外部存储（旧版权限模型）' }
+  ];
+
+  var ADB_MODES = [
+    { v: 'off',  name: '关闭', desc: '默认。所有 adb 命令都被拒绝' },
+    { v: 'safe', name: '安全模式', desc: '仅放行截屏 / 输入 / 读状态等只读命令' },
+    { v: 'full', name: '完整模式', desc: '允许任意 adb 命令（需二次确认，风险最高）' }
+  ];
+
+  /* ---------------- 渲染 ---------------- */
+
+  function esc(s) {
+    return String(s == null ? '' : s)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;');
+  }
+
+  function el(tag, cls, txt) {
+    var n = document.createElement(tag);
+    if (cls) n.className = cls;
+    if (txt != null) n.textContent = txt;
+    return n;
+  }
+
+  var CSS = [
+    /* ★★★ 2026-10-20 修（用户报「API 设置页面不能滚动，滑不到下面」）：
+     *
+     * 根因：面板被塞进官方设置面板的 content 区，而那个区域：
+     *   · 没有 overflow-y:auto（不能滚动）
+     *   · 父级是 position:fixed + height:100vh（高度被钉死）
+     *   · 本插件还给它加了 170px 的 padding-bottom（给弹出层留空间）
+     * ⇒ 内容超出后**直接被裁掉**，手指怎么滑都没用。
+     *
+     * ⇒ 让面板**自己成为滚动容器**，用视口高度约束它：
+     *   height:100dvh + overflow-y:auto
+     *   ★ 用 dvh 而不是 vh —— 移动端地址栏收放时 vh 会跳，dvh 才是真实可见高度。
+     *   ★ overscroll-behavior:contain 防止滑到底部时把整个设置面板带着滚。
+     *   ★ -webkit-overflow-scrolling:touch 让 iOS/部分 WebView 有惯性滚动。
+     *   ★ 底部额外留 80px，避免最后一项被系统手势条挡住。 */
+    '.dsh-api-wrap{height:100dvh;max-height:100dvh;overflow-y:auto;overflow-x:hidden;',
+    '  -webkit-overflow-scrolling:touch;overscroll-behavior:contain;',
+    '  box-sizing:border-box;padding:16px 14px calc(80px + env(safe-area-inset-bottom));',
+    '  font-size:14px;line-height:1.55;}',
+    '.dsh-api-h{font-size:16px;font-weight:600;margin:18px 0 8px;opacity:.92;}',
+    '.dsh-api-h:first-child{margin-top:0;}',
+    '.dsh-api-sub{font-size:12px;opacity:.55;margin:-4px 0 10px;}',
+    '.dsh-api-row{display:flex;align-items:flex-start;gap:10px;padding:11px 12px;',
+    '  border:1px solid rgba(128,128,128,.18);border-radius:10px;margin-bottom:8px;}',
+    '.dsh-api-row .t{flex:1;min-width:0;}',
+    '.dsh-api-row .n{font-weight:500;}',
+    '.dsh-api-row .d{font-size:12px;opacity:.55;margin-top:2px;}',
+    '.dsh-api-badge{flex:none;font-size:12px;padding:2px 8px;border-radius:99px;',
+    '  border:1px solid currentColor;opacity:.75;white-space:nowrap;}',
+    '.dsh-api-badge.on{color:#16a34a;background:rgba(22,163,74,.10);}',
+    '.dsh-api-badge.off{color:#b45309;background:rgba(180,83,9,.10);}',
+    '.dsh-api-btn{flex:none;font-size:12px;padding:5px 10px;border-radius:8px;cursor:pointer;',
+    '  border:1px solid rgba(128,128,128,.30);background:transparent;color:inherit;}',
+    '.dsh-api-btn:active{opacity:.6;}',
+    '.dsh-api-btn.primary{border-color:#4D6BFE;color:#4D6BFE;}',
+    '.dsh-api-btn.danger{border-color:#dc2626;color:#dc2626;}',
+    '.dsh-api-note{font-size:12px;opacity:.6;margin:6px 0 14px;}',
+    '.dsh-api-warn{font-size:12px;padding:10px 12px;border-radius:10px;margin:8px 0 14px;',
+    '  background:rgba(220,38,38,.08);border:1px solid rgba(220,38,38,.28);color:#b91c1c;}',
+    '.dsh-api-err{font-size:12px;padding:10px 12px;border-radius:10px;margin:8px 0;',
+    '  background:rgba(180,83,9,.08);border:1px solid rgba(180,83,9,.28);}',
+    /* ★ 长任务 / 暂时读不到 的提示条：蓝色，与错误（橙）区分开 */
+    '.dsh-api-busy{font-size:12px;padding:10px 12px;border-radius:10px;margin:8px 0;',
+    '  background:rgba(77,107,254,.08);border:1px solid rgba(77,107,254,.28);color:#4D6BFE;}',
+    '.dsh-api-btn:disabled{opacity:.5;cursor:default;}'
+  ].join('');
+
+  function ensureCss() {
+    if (document.getElementById('dsh-api-css')) return;
+    var s = document.createElement('style');
+    s.id = 'dsh-api-css';
+    s.textContent = CSS;
+    document.head.appendChild(s);
+  }
+
+  /** 骨架屏：数据还没回来时先画出结构，避免"空白/错误"让人以为坏了。 */
+  function renderSkeleton() {
+    if (!panelEl) return;
+    ensureCss();
+    panelEl.innerHTML = '';
+
+    panelEl.appendChild(el('div', 'dsh-api-sub',
+      '这些是「手机端 DSH」额外提供的能力。正在读取当前状态…'));
+
+    panelEl.appendChild(el('div', 'dsh-api-h', '系统权限'));
+    for (var i = 0; i < PERM_ITEMS.length; i++) {
+      var row = el('div', 'dsh-api-row');
+      var t = el('div', 't');
+      t.appendChild(el('div', 'n', PERM_ITEMS[i].name));
+      t.appendChild(el('div', 'd', PERM_ITEMS[i].desc));
+      row.appendChild(t);
+      row.appendChild(el('span', 'dsh-api-badge off', '读取中…'));
+      panelEl.appendChild(row);
+    }
+
+    panelEl.appendChild(el('div', 'dsh-api-h', 'ADB 扩展'));
+    panelEl.appendChild(el('div', 'dsh-api-warn',
+      '⚠️ ADB 是 shell 级权限，比任何普通应用都高。默认关闭，仅在你明确需要时开启。'));
+    panelEl.appendChild(el('div', 'dsh-api-note', '正在读取 ADB 状态…'));
+  }
+
+  /** 渲染整页（perms + adb）。数据缺失时显示占位。 */
+  function render() {
+    if (!panelEl) return;
+    ensureCss();
+    panelEl.innerHTML = '';
+
+    /* ---- 顶部说明 ---- */
+    var intro = el('div', 'dsh-api-sub',
+      '这些是「手机端 DSH」额外提供的能力。涉及系统权限的项目，' +
+      '点「去开启」会直接跳到对应的设置页面；你在系统里开好后，这里会自动勾上。');
+    panelEl.appendChild(intro);
+
+    /* ★ 长任务提示（apt 安装期间）—— 让用户知道"不是坏了，是在干活" */
+    if (busyHint) {
+      panelEl.appendChild(el('div', 'dsh-api-busy', '⏳ ' + busyHint));
+    } else if (staleErr && (lastPerms || lastAdb)) {
+      panelEl.appendChild(el('div', 'dsh-api-busy',
+        '⚠️ 暂时读不到最新状态（' + staleErr.slice(0, 120) + '），下面是上一次读到的值。'));
+    }
+
+    /* ---- 权限区 ---- */
+    panelEl.appendChild(el('div', 'dsh-api-h', '系统权限'));
+
+    if (!lastPerms) {
+      var e1 = el('div', 'dsh-api-err',
+        '权限状态读不到（容器桥未就绪）。稍后会自动重试。');
+      panelEl.appendChild(e1);
+    } else {
+      for (var i = 0; i < PERM_ITEMS.length; i++) {
+        panelEl.appendChild(permRow(PERM_ITEMS[i]));
+      }
+    }
+
+    /* ---- ADB 区 ---- */
+    panelEl.appendChild(el('div', 'dsh-api-h', 'ADB 扩展'));
+    var warn = el('div', 'dsh-api-warn',
+      '⚠️ ADB 是 shell 级权限，比任何普通应用都高。开启后容器里的程序能模拟任意点击、' +
+      '装/卸应用、读取其他应用数据。默认关闭，仅在你明确需要时开启。');
+    panelEl.appendChild(warn);
+
+    if (!lastAdb) {
+      panelEl.appendChild(el('div', 'dsh-api-err', 'ADB 状态读不到，稍后会自动重试。'));
+    } else {
+      panelEl.appendChild(adbBlock(lastAdb));
+    }
+
+    /* ---- 底部说明 ---- */
+    panelEl.appendChild(el('div', 'dsh-api-note',
+      '提示：所有能力都由容器内的 dsh-android 命令提供，' +
+      '在容器里敲 `dsh-android` 可看完整命令列表。'));
+  }
+
+  function permRow(item) {
+    var on = !!(lastPerms && lastPerms[item.key]);
+    var row = el('div', 'dsh-api-row');
+
+    var t = el('div', 't');
+    t.appendChild(el('div', 'n', item.name));
+    t.appendChild(el('div', 'd', item.desc));
+    row.appendChild(t);
+
+    var badge = el('span', 'dsh-api-badge ' + (on ? 'on' : 'off'), on ? '已开启' : '未开启');
+    row.appendChild(badge);
+
+    if (!on) {
+      var btn = el('button', 'dsh-api-btn primary', '去开启');
+      btn.addEventListener('click', function () {
+        btn.textContent = '跳转中…';
+        call('openperms', item.perm).then(function (used) {
+          btn.textContent = '去开启';
+          // ★ 跳过去后，用户在系统里开完回来，靠轮询自动同步（见 startPoll）
+          console.log('[DSH-API] openperms ->', used);
+        }).catch(function (e) {
+          btn.textContent = '去开启';
+          alert('跳转失败：' + e.message + '\n可在容器里执行：dsh-android openperms ' + item.perm);
+        });
+      });
+      row.appendChild(btn);
+    }
+    return row;
+  }
+
+  function adbBlock(st) {
+    var wrap = el('div');
+
+    var cur = (st && st.mode) || 'off';
+    for (var i = 0; i < ADB_MODES.length; i++) {
+      (function (m) {
+        var on = (cur === m.v);
+        var row = el('div', 'dsh-api-row');
+        var t = el('div', 't');
+        t.appendChild(el('div', 'n', m.name + (on ? '（当前）' : '')));
+        t.appendChild(el('div', 'd', m.desc));
+        row.appendChild(t);
+
+        var badge = el('span', 'dsh-api-badge ' + (on ? 'on' : 'off'), on ? '使用中' : '未启用');
+        row.appendChild(badge);
+
+        var btn = el('button', 'dsh-api-btn' + (m.v === 'full' ? ' danger' : ''), '切换');
+        btn.addEventListener('click', function () {
+          var args = m.v;
+          if (m.v === 'full') {
+            if (!confirm(
+              '切到「完整模式」吗？\n\n' +
+              '这会让容器里的程序获得 shell 级权限：\n' +
+              '· 模拟任意点击/滑动/输入\n' +
+              '· 安装或卸载应用\n' +
+              '· 读取其他应用的数据\n\n' +
+              '前提：你已在系统「开发者选项 → 无线调试」里开启并配对。\n' +
+              '确定继续？')) return;
+            args = 'full confirm=yes';
+          }
+          if (m.v === 'off') {
+            btn.textContent = '切换中…';
+            call('adb', 'mode off').then(refresh).catch(function (e) {
+              btn.textContent = '切换';
+              alert('切换失败：' + e.message);
+            });
+            return;
+          }
+          btn.textContent = '切换中…';
+          call('adb', 'mode ' + args).then(function () {
+            if (m.v !== 'off') {
+              // ★ 切到 safe/full 后提示去开无线调试
+              setTimeout(function () {
+                if (confirm('已切换到' + m.name + '。\n\n' +
+                  '还需要在系统里打开「无线调试」才能实际使用。\n' +
+                  '现在跳过去吗？')) {
+                  call('openperms', 'wireless').catch(function () {});
+                }
+              }, 120);
+            }
+            refresh();
+          }).catch(function (e) {
+            btn.textContent = '切换';
+            alert('切换失败：' + e.message);
+          });
+        });
+        row.appendChild(btn);
+        wrap.appendChild(row);
+      })(ADB_MODES[i]);
+    }
+
+    if (cur !== 'off') {
+      wrap.appendChild(pairBlock());
+    }
+    return wrap;
+  }
+
+  /* ★★★ 2026-10-20（用户实测后要求）：
+   * 「用悬浮窗。我把 dsh 变成悬浮窗之后就可以正常使用 dsh 而配对码仍然存在，
+   *   系统不会抢焦点…可以先把这个输入配对码的功能加进去，然后我试一下能不能成功。」
+   *
+   * 为什么这个设计能成立（用户实测结论）：
+   *   · 配对码只在「使用配对码配对设备」对话框打开时有效（1~2 分钟）
+   *   · 把 DSH 做成**小窗/分屏**，开发者选项留在主界面 ⇒ 对话框不消失、码不失效
+   *   · 于是用户可以在 DSH 里一边看着码一边输入
+   *
+   * 流程（照系统对话框上显示的两项来）：
+   *   ① 配对端口（5 位数字，和"调试端口"不是同一个）
+   *   ② 6 位配对码
+   *   → dsh-android adb pair <端口> <码>
+   *   → 成功后自动 adb connect <调试端口>
+   */
+  function pairBlock() {
+    var box = el('div');
+    box.appendChild(el('div', 'dsh-api-h', '配对（一次性）'));
+
+    box.appendChild(el('div', 'dsh-api-sub',
+      '需要先配对一次。请把本应用做成小窗/分屏（别让它全屏盖住开发者选项），' +
+      '然后在系统「开发者选项 → 无线调试 → 使用配对码配对设备」里会看到' +
+      '「配对端口」和「6 位配对码」，填到下面。'));
+
+    // 两个输入框
+    var row = el('div', 'dsh-api-row');
+    var t = el('div', 't');
+    t.appendChild(el('div', 'n', '无线调试配对'));
+
+    var w1 = el('div');
+    w1.style.cssText = 'display:flex;gap:8px;margin-top:8px;';
+    var inPort = document.createElement('input');
+    inPort.type = 'tel';
+    inPort.placeholder = '配对端口 (如 37241)';
+    inPort.inputMode = 'numeric';
+    inPort.style.cssText = 'flex:1;min-width:0;padding:7px 9px;border-radius:8px;'
+      + 'border:1px solid rgba(128,128,128,.35);background:transparent;color:inherit;font-size:13px;';
+    var inCode = document.createElement('input');
+    inCode.type = 'tel';
+    inCode.placeholder = '6 位配对码';
+    inCode.maxLength = 6;
+    inCode.inputMode = 'numeric';
+    inCode.style.cssText = 'flex:1;min-width:0;padding:7px 9px;border-radius:8px;'
+      + 'border:1px solid rgba(128,128,128,.35);background:transparent;color:inherit;font-size:13px;';
+    w1.appendChild(inPort);
+    w1.appendChild(inCode);
+    t.appendChild(w1);
+    t.appendChild(el('div', 'd', '配对成功后就长期有效，以后只需填调试端口。'));
+    row.appendChild(t);
+
+    var btn = el('button', 'dsh-api-btn primary', '配对');
+    btn.addEventListener('click', function () {
+      var p = (inPort.value || '').trim();
+      var code = (inCode.value || '').trim();
+      if (!/^\d{2,6}$/.test(p)) { alert('配对端口看起来不对（应该是几位数字）'); return; }
+      if (!/^\d{6}$/.test(code)) { alert('配对码应该是 6 位数字'); return; }
+      btn.textContent = '配对中…';
+      btn.disabled = true;
+      // ★ 配对要等 TLS 握手 + 网络，期间别让轮询抢资源（与「安装」同理）
+      busyHint = '正在配对（约 10~30 秒），请保持本应用在前台/小窗…';
+      busyUntil = Date.now() + 60000;
+      holdPoll();
+      render();
+      call('adb', 'pair ' + p + ' ' + code).then(function (r) {
+        btn.textContent = '配对';
+        btn.disabled = false;
+        busyUntil = 0;
+        busyHint = '';
+        var txt = String((r && r.data != null) ? r.data : r || '');
+        if (/Successfully paired/i.test(txt)) {
+          alert('配对成功！\n\n现在回到系统「无线调试」页面，\n' +
+            '把上面的「IP 地址和端口」那个端口（不是配对端口）填到下面的连接框里。');
+          inPort.value = '';
+          inCode.value = '';
+          refresh();
+          startPoll();
+        } else {
+          alert('配对未成功：\n' + txt.slice(0, 500) +
+            '\n\n常见原因：\n· 配对码已过期（回系统页面重新生成一个）\n' +
+            '· 配对端口填错了（要填「配对端口」，不是调试端口）\n' +
+            '· 本应用被切到后台导致配对对话框关闭');
+          refresh();
+          startPoll();
+        }
+      }).catch(function (e) {
+        btn.textContent = '配对';
+        btn.disabled = false;
+        busyUntil = 0;
+        busyHint = '';
+        alert('配对请求失败：' + e.message);
+        refresh();
+        startPoll();
+      });
+    });
+    row.appendChild(btn);
+    box.appendChild(row);
+
+    // ---- 连接（调试端口）----
+    var row2 = el('div', 'dsh-api-row');
+    var t2 = el('div', 't');
+    t2.appendChild(el('div', 'n', '连接'));
+    var inConn = document.createElement('input');
+    inConn.type = 'tel';
+    inConn.placeholder = '调试端口（留空自动发现）';
+    inConn.inputMode = 'numeric';
+    inConn.style.cssText = 'width:100%;margin-top:8px;padding:7px 9px;border-radius:8px;'
+      + 'border:1px solid rgba(128,128,128,.35);background:transparent;color:inherit;font-size:13px;';
+    if (lastAdb && lastAdb.port) inConn.value = lastAdb.port;
+    t2.appendChild(inConn);
+    /* ★★★ 2026-10-20（用户要求）：端口**自动发现**。
+     *
+     * 无线调试的调试端口每次开关/重启都会变，让用户手填不现实。
+     * APK 侧已经能从 /proc/net/tcp6 认出 adbd（唯一绑 `[::]` 的那个），
+     * 页面这里只需把"留空=自动"说清楚，并在拿到端口后显示出来。
+     */
+    t2.appendChild(el('div', 'd',
+      (lastAdb && lastAdb.portLive)
+        ? ('已自动发现端口 ' + lastAdb.port + '，直接点「连接」即可。')
+        : '留空即可自动发现端口；发现不到再手填。'));
+    row2.appendChild(t2);
+
+    var btn2 = el('button', 'dsh-api-btn primary', '连接');
+    btn2.addEventListener('click', function () {
+      var port = (inConn.value || '').trim();
+      if (port && !/^\d{2,6}$/.test(port)) { alert('端口看起来不对（应该是几位数字）'); return; }
+      btn2.textContent = '连接中…';
+      btn2.disabled = true;
+      busyHint = '正在连接 adb（约 5~20 秒）…';
+      busyUntil = Date.now() + 60000;
+      holdPoll();
+      render();
+      // ★ 不填端口 ⇒ 后端自动发现
+      call('adb', port ? ('connect ' + port) : 'connect').then(function (r) {
+        btn2.textContent = '连接';
+        btn2.disabled = false;
+        busyUntil = 0;
+        busyHint = '';
+        var txt = String((r && r.data != null) ? r.data : r || '');
+        if (/connected to/i.test(txt)) {
+          alert('连接成功！现在容器里可以使用 adb 命令了。');
+        } else {
+          alert('连接未成功：\n' + txt.slice(0, 500));
+        }
+        refresh();
+        startPoll();
+      }).catch(function (e) {
+        btn2.textContent = '连接';
+        btn2.disabled = false;
+        busyUntil = 0;
+        busyHint = '';
+        alert('连接请求失败：' + e.message);
+        refresh();
+        startPoll();
+      });
+    });
+    row2.appendChild(btn2);
+    box.appendChild(row2);
+
+    // ---- 准备：安装容器内的 adb 客户端 ----
+    var row3 = el('div', 'dsh-api-row');
+    var t3 = el('div', 't');
+    t3.appendChild(el('div', 'n', '准备：安装 adb 客户端'));
+    t3.appendChild(el('div', 'd', '容器是精简 Debian，默认没有 adb。首次使用前装一次（需联网，约 10~60 秒）。'));
+    row3.appendChild(t3);
+    var btn3 = el('button', 'dsh-api-btn', '安装');
+    btn3.addEventListener('click', function () {
+      /* ★★★ 2026-10-20（用户报「点安装之后就显示超时，然后马上整个页面读不了」）：
+       *
+       * apt 装包要几十秒，期间容器被占满。原来这里：
+       *   ① 没停轮询 ⇒ 每 1.5s 还在 spawn 新进程抢 CPU
+       *   ② 服务端 15s 超时（已在 index.js 修成 180s）
+       *   ③ 前端 catch 里只 alert，页面数据又被轮询失败清空
+       * ⇒ 用户看到的是"超时 + 整页读不了"。
+       *
+       * ⇒ 现在：先暂停轮询，把 busy 标出来，任务结束再恢复。 */
+      btn3.textContent = '安装中…';
+      btn3.disabled = true;
+      busyHint = '正在安装 adb 客户端（apt），可能要几十秒，请勿关闭页面…';
+      busyUntil = Date.now() + 180000;
+      holdPoll();
+      render();
+      call('adb', 'install-client').then(function (r) {
+        btn3.textContent = '安装';
+        btn3.disabled = false;
+        busyUntil = 0;
+        busyHint = '';
+        var txt = String((r && r.data != null) ? r.data : r || '');
+        var stillMissing = /没有 adb|not found|No such file/i.test(txt);
+        if (stillMissing) {
+          alert('安装似乎没成功：\n' + txt.slice(0, 600) +
+            '\n\n请确认手机能联网，然后再点一次「安装」。');
+        } else {
+          alert('完成。\n' + txt.slice(0, 400));
+        }
+        refresh();
+        startPoll();
+      }).catch(function (e) {
+        btn3.textContent = '安装';
+        btn3.disabled = false;
+        busyUntil = 0;
+        busyHint = '';
+        alert('安装失败：' + e.message);
+        refresh();
+        startPoll();
+      });
+    });
+    row3.appendChild(btn3);
+    box.appendChild(row3);
+
+    return box;
+  }
+
+  /* ---------------- 数据刷新（自动同步） ---------------- */
+
+  /** 刷新权限 + ADB 状态。
+   *
+   * ★★★ 2026-10-20 修（用户报「点了安装就网络超时，然后整页读不了」）：
+   *
+   * 原来这里是 `call(...).catch(()=>null)` ⇒ **任何一次失败都会把 lastPerms/lastAdb
+   * 覆盖成 null** ⇒ 页面立刻变成"读不到状态"，而且下次回来还得重新等。
+   * 用户点了「安装」之后 apt 占满容器，轮询全部超时 ⇒ 整页变空 ——
+   * 这正是他看到的"整个页面读不了"。
+   *
+   * ⇒ 改成：
+   *   ① 失败**不清空**已有数据（保留上一次成功值，页面继续显示）
+   *   ② 服务端返回 busy（正在 apt）时，暂停轮询并显示提示
+   *   ③ 连续失败走指数退避，不再 1.5 秒一直轰炸
+   */
+  function refresh() {
+    return Promise.all([
+      callRaw('perms').catch(function (e) { return { ok: false, _e: e }; }),
+      callRaw('adb', 'status').catch(function (e) { return { ok: false, _e: e }; })
+    ]).then(function (r) {
+      var rp = r[0], ra = r[1];
+
+      // 服务端说"正在跑长任务" ⇒ 暂停轮询
+      if ((rp && rp.busy) || (ra && ra.busy)) {
+        busyHint = (rp && rp.busyHint) || (ra && ra.busyHint) || '容器正在忙，请稍候…';
+        holdPoll();
+        render();
+        return;
+      }
+
+      var perms = (rp && rp.ok === true) ? parseData(rp.data) : null;
+      var adb = (ra && ra.ok === true) ? parseData(ra.data) : null;
+      var gotAny = (perms != null) || (adb != null);
+
+      if (!gotAny) {
+        failStreak++;
+        staleErr = (rp && rp.error) || (ra && ra.error) || '读取失败';
+        backoffPoll();
+        // ★ 已有数据就留着，只标"暂时读不到"
+        if (lastPerms || lastAdb) render();
+        return;
+      }
+
+      failStreak = 0;
+      staleErr = '';
+      busyHint = '';
+      pollDelay = POLL_MS;
+
+      var changed = (perms != null && JSON.stringify(perms) !== JSON.stringify(lastPerms))
+                 || (adb != null && JSON.stringify(adb) !== JSON.stringify(lastAdb));
+      if (perms != null) lastPerms = perms;   // ★ 只有真的拿到了才覆盖
+      if (adb != null) lastAdb = adb;
+      if (changed) render();   // ★ 只在真的变了才重绘，避免每 1.5s 闪一次
+    });
+  }
+
+  /** 长任务期间彻底停轮询，到时间自动恢复一次。 */
+  function holdPoll() {
+    stopPoll();
+    var wait = Math.max(busyUntil - Date.now(), 3000);
+    setTimeout(function () {
+      if (!panelEl || !document.body.contains(panelEl)) return;
+      if (document.hidden) return;
+      refresh();
+    }, wait);
+  }
+
+  /** 连续失败 → 1.5s → 3s → 6s … 30s 封顶。 */
+  function backoffPoll() {
+    if (!pollTimer) return;
+    clearInterval(pollTimer);
+    pollTimer = null;
+    pollDelay = Math.min(pollDelay * 2, POLL_MAX_MS);
+    pollTimer = setInterval(function () {
+      if (document.hidden) return;
+      if (!panelEl || !document.body.contains(panelEl)) return;
+      refresh();
+    }, pollDelay);
+  }
+
+  /** 页面可见时才轮询 —— 用户切去系统设置开权限、再切回来，立刻就能看到。 */
+  function startPoll() {
+    stopPoll();
+    pollDelay = POLL_MS;
+    pollTimer = setInterval(function () {
+      if (document.hidden) return;
+      if (!panelEl || !document.body.contains(panelEl)) return;
+      refresh();
+    }, POLL_MS);
+  }
+  function stopPoll() {
+    if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+  }
+
+  /* ---------------- 挂进官方设置面板 ---------------- */
+
+  var NAV_ID = 'dsh-api-nav';
+
+  /** 在设置面板的 nav 里插入「API 设置」一项（幂等）。
+   *
+   * ★★★ 2026-10-20 修正（用户指出「怎么明显和上面隔开了」）：
+   *   上一版用 `nav.appendChild(item)` 追加到**列表最末**，
+   *   而官方 nav 是分组布局（navCell 之间可能有分隔/间距）
+   *   ⇒ 我们的项被甩到最后、看起来像单独一组。
+   *
+   *   ⇒ 现在改成：
+   *     · 克隆**第一个** navCell 当模板（拿它的样式类，不是内容）
+   *     · 插到**第 2 个位置**（紧跟第一个），视觉上属于同一组
+   *     · 清除 aria-* / tabindex，避免污染官方的可访问性树
+   *     · 文字换成「API 设置」，图标沿用模板的（不额外造图标）
+   *   ★ 仍需克隆的原因：官方样式是 CSS module 哈希类名，自己造类名会完全不像。 */
+  function injectNav(dlg) {
+    try {
+      if (!dlg) return;
+      if (dlg.querySelector('#' + NAV_ID)) return;
+      var nav = dlg.querySelector('[class*="nav"]');
+      if (!nav) return;
+
+      var cells = nav.querySelectorAll('[class*="navCell"]');
+      if (!cells || cells.length === 0) return;
+      var tpl = cells[0];                      // ★ 用第一个当模板（样式最标准）
+
+      var item = tpl.cloneNode(true);
+      item.id = NAV_ID;
+      item.setAttribute('data-dsh-api-nav', '1');
+      item.removeAttribute('aria-current');
+      item.removeAttribute('aria-selected');
+      item.removeAttribute('tabindex');
+      item.className = tpl.className
+        .replace(/\S*(active|selected|current)\S*/gi, '')
+        .replace(/\s+/g, ' ').trim();
+
+      var txt = item.querySelector('span,div');
+      if (txt) txt.textContent = 'API 设置';
+      else item.textContent = 'API 设置';
+
+      // ★ 插到第 2 位（紧跟第一个），而不是 append 到末尾
+      if (cells.length >= 2 && cells[1].parentNode) {
+        cells[1].parentNode.insertBefore(item, cells[1]);
+      } else if (tpl.parentNode) {
+        tpl.parentNode.insertBefore(item, tpl.nextSibling);
+      } else {
+        nav.appendChild(item);
+      }
+
+      console.log('[DSH-API] 已在设置导航插入「API 设置」（位置 2）');
+    } catch (e) {
+      console.warn('[DSH-API] injectNav 失败', e);
+    }
+  }
+
+  /** 点「API 设置」时，把 content 区换成我们的面板。 */
+  function showPanel(dlg) {
+    try {
+      var content = dlg.querySelector('[class*="content"]');
+      if (!content) return;
+      // 隐藏官方原有内容（不删，返回时能恢复）
+      var kids = content.children;
+      for (var i = 0; i < kids.length; i++) {
+        if (kids[i].getAttribute('data-dsh-api-keep') === '1') continue;
+        kids[i].style.display = 'none';
+      }
+      /* ★ 2026-10-20：content 区本身也放开高度限制 ——
+         它是个 flex/grid 容器时会按内容撑、或按父级裁，
+         两种都会让我们的 100dvh 出错。这里明确允许溢出可见。 */
+      try {
+        content.style.setProperty('overflow', 'visible', 'important');
+        content.style.setProperty('height', 'auto', 'important');
+        content.style.setProperty('max-height', 'none', 'important');
+      } catch (e) {}
+      // 我们的面板只建一次
+      if (!panelEl || !content.contains(panelEl)) {
+        panelEl = el('div', 'dsh-api-wrap');
+        panelEl.setAttribute('data-dsh-api-keep', '1');
+        panelEl.setAttribute('data-dsh-api-panel', '1');
+        content.appendChild(panelEl);
+      }
+      panelEl.style.display = '';
+
+      /* ★★★ 2026-10-20（用户报「进这个页面要等 1 分多钟才看到设置项」）：
+       *
+       * 原来这里是「先 render（此时 lastPerms 为空 ⇒ 显示'读不到'）→ 再 refresh」，
+       * 用户看到的就是一段"读不到"的空壳，直到 refresh 返回才变成真内容。
+       * 冷启动时 refresh 要 spawn dsh-android（几十秒），于是整页像卡死。
+       *
+       * ⇒ 改成**先给骨架**：如果还没有数据，立刻画出"正在读取"的占位，
+       *   让用户马上看到页面的结构和标题（而不是空白或错误）。
+       *   数据到了再无缝替换。 */
+      if (!lastPerms && !lastAdb) {
+        renderSkeleton();
+      } else {
+        render();
+      }
+      // ★ 立刻刷一次，并且在等待期间再补一次（冷启动时第一次可能很慢）
+      refresh();
+      startPoll();
+    } catch (e) {
+      console.warn('[DSH-API] showPanel 失败', e);
+    }
+  }
+
+  function hidePanel(dlg) {
+    try {
+      if (!panelEl) return;
+      panelEl.style.display = 'none';
+      var content = dlg && dlg.querySelector('[class*="content"]');
+      if (content) {
+        var kids = content.children;
+        for (var i = 0; i < kids.length; i++) {
+          if (kids[i].getAttribute('data-dsh-api-keep') === '1') continue;
+          kids[i].style.display = '';
+        }
+        // ★ 撤掉 showPanel 里加的高度覆盖，把 content 还给官方
+        try {
+          content.style.removeProperty('overflow');
+          content.style.removeProperty('height');
+          content.style.removeProperty('max-height');
+        } catch (e) {}
+      }
+      stopPoll();
+    } catch (e) {}
+  }
+
+  /** 找出当前打开的设置面板（与主插件同一判据）。 */
+  function findDialog() {
+    var all = document.querySelectorAll('[role="dialog"]');
+    for (var i = 0; i < all.length; i++) {
+      if (all[i].hasAttribute('data-dsh-ghost')) continue;
+      if (all[i].querySelector('[class*="navCell"],[class*="content"] > [class*="options"]')) return all[i];
+    }
+    return null;
+  }
+
+  /* ---------------- 事件接线 ---------------- */
+
+  function boot() {
+    // ① 点 nav 里的「API 设置」
+    document.addEventListener('click', function (ev) {
+      var t = ev.target;
+      if (!t || !t.closest) return;
+      var nav = t.closest('#' + NAV_ID);
+      if (!nav) return;
+      var dlg = findDialog();
+      if (!dlg) return;
+      showPanel(dlg);
+      ev.preventDefault();
+      ev.stopPropagation();
+    }, true);
+
+    // ② 点别的 nav 项 ⇒ 收起我们的面板，恢复官方内容
+    document.addEventListener('click', function (ev) {
+      var t = ev.target;
+      if (!t || !t.closest) return;
+      if (t.closest('#' + NAV_ID)) return;                 // 我们自己
+      var cell = t.closest('[class*="navCell"]');
+      if (!cell) return;
+      var dlg = findDialog();
+      if (!dlg) return;
+      if (!panelEl) return;
+      hidePanel(dlg);
+    }, true);
+
+    // ③ 面板出现时注入 nav（MutationObserver，覆盖"设置关了又开"）
+    try {
+      new MutationObserver(function () {
+        var dlg = findDialog();
+        if (dlg) injectNav(dlg);
+      }).observe(document.body, { childList: true, subtree: true });
+    } catch (e) {}
+
+    // ④ 首屏若已有面板（热重载场景）
+    var d0 = findDialog();
+    if (d0) injectNav(d0);
+
+    // ⑤ 页面重新可见时立刻刷一次（用户从系统设置切回来）
+    document.addEventListener('visibilitychange', function () {
+      if (!document.hidden && panelEl && document.body.contains(panelEl)) refresh();
+    });
+
+    try {
+      window.__dshApiSettings = {
+        refresh: refresh,
+        render: render,
+        show: function () { var d = findDialog(); if (d) showPanel(d); },
+        hide: function () { var d = findDialog(); if (d) hidePanel(d); },
+        state: function () { return { perms: lastPerms, adb: lastAdb }; }
+      };
+    } catch (e) {}
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', boot, { once: true });
+  } else {
+    boot();
+  }
+})();
+
 
     exports.name = "dsh-mobile-adaption";
     exports.apply = apply;

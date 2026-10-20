@@ -153,17 +153,53 @@ final class Cfg {
      *   这次就是这样卡住的（只看到「容器已退出」，不知道哪一步炸的）。
      *   ⇒ 镜像到共享目录后，`adb pull /sdcard/DeepseekHarness/boot.log` 直接能读。
      */
+    /* ★★★ 2026-10-20（据环境勘察报告 P3）：日志**按大小轮转**。
+     *
+     * 报告实测：web.log 已 1.6 MB / 3503 行且**无轮转、随使用无限增长**；
+     * boot.log 也已 130 KB（43 次启动）。手机上这既占空间，又让
+     * `adb pull` 越来越慢、grep 越来越难定位最近一次启动。
+     *
+     * 策略：
+     *   · 单文件超过 ROTATE_AT（2 MB）⇒ 改名成 `<name>.1`（旧的 .1 直接覆盖）
+     *   · 只保留 1 份历史 ⇒ 总占用上界 ≈ 4 MB/文件
+     *   · 每次写入前检查，但**不 stat 每一次**（每 50 次查一下，避免 IO 抖动）
+     *
+     * ★ 轮转失败绝不能影响主流程（全程 try/catch）。 */
+    private static final long ROTATE_AT = 2L * 1024 * 1024;   // 2 MB
+    private static int logWrites = 0;
+
+    /** 若文件过大则轮转成 .1（覆盖旧 .1）。调用方无需关心失败。 */
+    static void rotateIfBig(java.io.File f) {
+        try {
+            if (!f.exists() || f.length() < ROTATE_AT) return;
+            java.io.File old = new java.io.File(f.getParentFile(), f.getName() + ".1");
+            //noinspection ResultOfMethodCallIgnored
+            old.delete();
+            //noinspection ResultOfMethodCallIgnored
+            f.renameTo(old);
+        } catch (Throwable ignored) { }
+    }
+
     static void log(Context c, String msg) {
         String line = new java.text.SimpleDateFormat("HH:mm:ss.SSS", java.util.Locale.US)
                 .format(new java.util.Date()) + "  " + msg + "\n";
         byte[] bytes = line.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+
+        // ★ 每 50 次写检查一次是否该轮转（别每次都 stat，省 IO）
+        boolean checkRotate = (++logWrites % 50 == 0);
+        java.io.File dir = sharedRoot(c);
+        if (checkRotate) {
+            rotateIfBig(bootLog(c));
+            try { rotateIfBig(new java.io.File(dir, "boot.log")); } catch (Throwable ignored) { }
+            try { rotateIfBig(new java.io.File(dir, "web.log")); } catch (Throwable ignored) { }
+        }
+
         try (java.io.FileOutputStream fos = new java.io.FileOutputStream(bootLog(c), true)) {
             fos.write(bytes);
         } catch (Exception ignored) {
         }
         // ★ 镜像到外部（失败无所谓，不能因为它影响主流程）
         try {
-            java.io.File dir = sharedRoot(c);
             if (dir.exists() || dir.mkdirs() || dir.exists()) {
                 try (java.io.FileOutputStream fos =
                              new java.io.FileOutputStream(new java.io.File(dir, "boot.log"), true)) {

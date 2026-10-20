@@ -25,8 +25,8 @@ android {
         //   本方案的容器能力上限因此与 Termux **完全一致**。
         // ★ 代价：不能上架 Google Play（侧载分发不受影响）。
         targetSdk = 28
-        versionCode = 1
-        versionName = "1.0.0"
+        versionCode = 3
+        versionName = "1.0.2"
         // 只发 arm64（用户手机是 arm64-v8a；也省体积）
         ndk { abiFilters += "arm64-v8a" }
     }

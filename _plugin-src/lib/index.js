@@ -310,11 +310,231 @@ async function handler(req, res) {
 export const name = "dsh-mobile-adaption";
 export const inject = ["webServer"];
 
+/* ==========================================================================
+ * ★★★ 2026-10-20：Android 能力桥的**服务端转发路由**
+ *
+ * 浏览器端（WebView 里的 API 设置页）不能直接跑 shell，
+ * 所以走：页面 fetch → 这里 → spawn `dsh-android <cmd>` → 抽象 socket → APK。
+ *
+ * 路由：`/dsh-mobile/api/<cmd>?args=<urlencoded>`
+ * 返回：`{ ok: true, data: "<原始输出>" }` 或 `{ ok: false, error: "..." }`
+ *
+ * ★ 安全考量：
+ *   · **只允许白名单 cmd**（见 ALLOW_CMDS），不接受任意命令
+ *   · args 只做原样传参（会被 execFile 的数组形式保护，不经 shell）
+ *   · 不提供文件读写类命令
+ * ========================================================================== */
+const API_ROUTE = "/dsh-mobile/api";
+
+/** 允许从页面转发的命令（与 dsh-android 的子命令一一对应）。 */
+const ALLOW_CMDS = new Set([
+  "perms", "openperms",
+  "adb",                       // 内部再按 AdbBridge 的模式/白名单把关
+  "clipboard-get", "clipboard-set",
+  "toast", "notify", "vibrate",
+  "battery", "device",
+  "tts", "tts-stop",
+  "sensors", "apps", "location",
+  "openurl", "share",
+  "ping"
+]);
+
+/* ★★★ 2026-10-20 修：本文件是 **ESM**（package.json 里 "type":"module"），
+ *   里面**不能用 `require`**。我一开始写了 require("node:child_process")，
+ *   运行时报 `ReferenceError: require is not defined` —— 路由整个不工作。
+ *   ⇒ 改成顶部 import。 */
+import { execFile } from "node:child_process";
+
+/* ★★★ 2026-10-20（用户报「每次 API 桥都要加载这么久，要等 1 分多钟」）：
+ *
+ * 根因：每次页面来一个请求，都会 `execFile("dsh-android", ...)` ——
+ *   那是一个 **Node 进程**，启动 + 连抽象 socket 本身要几十上百毫秒；
+ *   而在冷启动/容器刚起来时，第一次 spawn 还要等动态链接、等 /dtmp 就绪，
+ *   实测波动极大（热态 0.2~1.7s，冷态可能几十秒）。
+ *
+ * ⇒ 两层优化：
+ *   ① **结果缓存**（perms / adb status 这类状态查询，缓存 3 秒）——
+ *      页面每 1.5 秒轮询一次，缓存能挡掉一半以上的 spawn。
+ *   ② **失败短缓存**（10 秒）—— 桥没起来时不要每 1.5 秒重试轰炸。
+ *
+ * ★ 不做更激进的常驻连接：那需要父子进程长连协议，改动面大；
+ *   当前这两个优化已能把「打开就等一分钟」压到「打开即有」。
+ */
+const CACHE_TTL_MS = 3000;
+const FAIL_TTL_MS = 10000;
+const cache = new Map();   // key -> { at, value }
+
+/* ★ 长任务闸门（install-client 等）：跑着的时候拒绝为只读轮询再 spawn。
+ *   见 apiHandler 里的注释。 */
+let longTask = false;
+let longTaskHint = "";
+
+function cacheGet(key) {
+  const e = cache.get(key);
+  if (!e) return null;
+  const ttl = e.value && e.value.ok ? CACHE_TTL_MS : FAIL_TTL_MS;
+  if (Date.now() - e.at > ttl) { cache.delete(key); return null; }
+  return e.value;
+}
+function cachePut(key, value) {
+  cache.set(key, { at: Date.now(), value: value });
+}
+
+/* ★★★ 2026-10-20 修（用户报「点了安装就网络超时，然后整页读不了」）：
+ *
+ * 根因：这里 timeout 写死 **15 秒**，但 `adb install-client` 要在容器里跑
+ *   `apt-get update && apt-get install -y android-tools-adb` —— **几十秒到几分钟**。
+ *   15 秒一到 execFile 就把进程杀掉 ⇒ 前端收到失败 ⇒ 弹「网络超时」。
+ *   更糟的是 apt 占满容器 CPU/IO，同一时刻的 perms / adb status 轮询也一起超时
+ *   ⇒ 用户看到的表象是「权限和 ADB 都读不到状态」。
+ *
+ *   Java 侧（AdbBridge.installClient）本来就有 180 秒 waitFor，
+ *   是**服务端这一层**先把它掐死的。
+ *
+ * ⇒ 按命令区分超时（只放宽确实会长时间跑的那几条，其余保持 15 秒以免拖死页面）：
+ *   · install-client —— apt 装包，给 180 秒
+ *   · adb pair / adb connect —— 要等 TLS 握手 + 网络往返，给 60 秒
+ *   · 其余 —— 15 秒
+ */
+const TIMEOUT_DEFAULT_MS = 15000;
+const TIMEOUT_LONG_MS = 180000;   // install-client（apt）
+const TIMEOUT_ADB_NET_MS = 60000; // adb pair / adb connect
+
+function timeoutFor(cmd, args) {
+  if (cmd === "adb") {
+    const sub = String(args || "").trim().split(/\s+/)[0] || "";
+    if (sub === "install-client") return TIMEOUT_LONG_MS;
+    if (sub === "pair" || sub === "connect") return TIMEOUT_ADB_NET_MS;
+    return TIMEOUT_DEFAULT_MS;
+  }
+  return TIMEOUT_DEFAULT_MS;
+}
+
+function runCli(cmd, args) {
+  const tmo = timeoutFor(cmd, args);
+  return new Promise((resolve) => {
+    // ★ 一律 execFile + 数组参数：不经 shell，args 里的特殊字符不会被解释
+    execFile("dsh-android", [cmd].concat(args ? [args] : []),
+      { timeout: tmo, maxBuffer: 4 << 20, killSignal: "SIGKILL" },
+      (err, stdout, stderr) => {
+        if (err) {
+          const died = err.killed || err.signal;
+          const msg = String(stderr || err.message || err).slice(0, 4000);
+          resolve({
+            ok: false,
+            timeout: tmo,
+            error: died
+              ? ("命令超时（" + Math.round(tmo / 1000) + " 秒）：" + cmd +
+                 (args ? " " + args : "") + "\n" + msg)
+              : msg
+          });
+        } else {
+          resolve({ ok: true, data: String(stdout || "").slice(0, 200000) });
+        }
+      });
+  });
+}
+
+/** 同一个 key 的并发请求合并成一次 spawn（避免轮询叠加）。 */
+const inflight = new Map();
+async function runCliCached(cmd, args) {
+  const key = cmd + "\u0001" + (args || "");
+  const hit = cacheGet(key);
+  if (hit) return hit;
+  if (inflight.has(key)) return inflight.get(key);
+
+  const p = runCli(cmd, args).then((v) => {
+    cachePut(key, v);
+    inflight.delete(key);
+    return v;
+  }).catch((e) => {
+    inflight.delete(key);
+    return { ok: false, error: String(e) };
+  });
+  inflight.set(key, p);
+  return p;
+}
+
+async function apiHandler(req, res) {
+  try {
+    const u = new URL(req.url, "http://127.0.0.1");
+    // path 形如 /dsh-mobile/api/<cmd>
+    const seg = u.pathname.slice(API_ROUTE.length + 1);
+    const cmd = decodeURIComponent(seg || "");
+    const args = u.searchParams.get("args") || "";
+
+    if (!cmd || !ALLOW_CMDS.has(cmd)) {
+      res.writeHead(400, { "content-type": "application/json; charset=utf-8" });
+      res.end(JSON.stringify({ ok: false, error: "命令不被允许: " + cmd }));
+      return;
+    }
+
+    /* ★★★ 2026-10-20（用户报「点安装后整页读不了」的第二层原因）：
+     *
+     * install-client 跑 apt 期间会**长时间占满容器**，此时前端每 1.5 秒
+     * 还在轮询 perms / adb status —— 每个轮询都会再 spawn 一个 node 去连桥，
+     * 排在 apt 后面一起超时，页面于是显示"全部读不到"。
+     *
+     * ⇒ 服务端记一个**长任务闸门**：正在跑 install-client 时，
+     *   只读状态查询**直接返回上次缓存（或 busy 标记）**，绝不再 spawn 抢资源。
+     *   前端拿到 busy 后显示"正在安装，请稍候"并暂停轮询。 */
+    const sub = cmd === "adb" ? (String(args).trim().split(/\s+/)[0] || "") : "";
+    const isLongTask = (sub === "install-client");
+    const isReadOnly = (cmd === "perms" || (cmd === "adb" && sub === "status"));
+
+    if (longTask && isReadOnly) {
+      const cached = cacheGet(cmd === "adb" ? "adb:status" : cmd);
+      res.writeHead(200, { "content-type": "application/json; charset=utf-8" });
+      res.end(JSON.stringify({
+        ok: true,
+        busy: true,
+        busyHint: longTaskHint,
+        data: cached && cached.ok ? cached.data : ""
+      }));
+      return;
+    }
+
+    if (isLongTask) {
+      longTask = true;
+      longTaskHint = "正在安装 adb 客户端（apt），可能需要几十秒到几分钟，请勿离开";
+    }
+
+    /* ★ 只对**只读状态查询**走缓存；有副作用的命令（openperms / toast / notify /
+     *   vibrate / clipboard-set / adb mode 等）必须每次都真跑，不能缓存。 */
+    const CACHEABLE = new Set(["perms", "adb:status", "battery", "device", "sensors", "ping"]);
+    const cacheKey = cmd === "adb" ? ("adb:" + sub) : cmd;
+
+    let out;
+    try {
+      out = CACHEABLE.has(cacheKey)
+        ? await runCliCached(cmd, args)
+        : await runCli(cmd, args);
+    } finally {
+      if (isLongTask) { longTask = false; longTaskHint = ""; }
+    }
+
+    res.writeHead(200, { "content-type": "application/json; charset=utf-8" });
+    res.end(JSON.stringify(out));
+  } catch (e) {
+    longTask = false; longTaskHint = "";
+    try {
+      res.writeHead(500, { "content-type": "application/json; charset=utf-8" });
+      res.end(JSON.stringify({ ok: false, error: String(e).slice(0, 2000) }));
+    } catch (e2) {}
+  }
+}
+
 export function apply(ctx) {
   /* ★ 注册失败也不能让插件整体失效（与 client 半的"兜底降级"同一原则） */
   try {
     ctx.effect(() => ctx.webServer.register({ kind: "prefix", path: ROUTE, handler }));
   } catch (e) {
     try { console.warn("[dsh-mobile-adaption] 报告路由注册失败：", e); } catch (e2) {}
+  }
+  /* ★ 2026-10-20：Android 能力桥的转发路由 */
+  try {
+    ctx.effect(() => ctx.webServer.register({ kind: "prefix", path: API_ROUTE, handler: apiHandler }));
+  } catch (e) {
+    try { console.warn("[dsh-mobile-adaption] API 路由注册失败：", e); } catch (e2) {}
   }
 }

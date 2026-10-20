@@ -185,6 +185,20 @@ public class DshService extends Service {
             java.util.List<String> cmd = ProotLauncher.buildCommand(this);
             Cfg.log(this, "cmd = " + String.join(" ", cmd));
 
+            /* ★★★ 2026-10-20：**先把 API 桥起来**，再拉起容器。
+             *
+             * 顺序有讲究：容器里的脚本可能一启动就调 API（比如读剪贴板），
+             * 若桥还没 listen 就会 connect 失败。桥本身很轻（只 bind 一个
+             * 抽象 socket），放在容器启动前没有代价。
+             *
+             * ★ 失败绝不影响容器启动 —— 桥挂了顶多是"没有 Android 能力"，
+             *   而容器跑不起来才是致命的。 */
+            try {
+                ApiBridge.start(this);
+            } catch (Throwable t) {
+                Cfg.log(this, "⚠️ API 桥启动失败（不影响容器）: " + t);
+            }
+
             ProcessBuilder pb = new ProcessBuilder(cmd);
             pb.redirectErrorStream(true);
             ProotLauncher.applyEnv(pb, this);
@@ -377,6 +391,29 @@ public class DshService extends Service {
                     + "cp /root/.dsh/profiles/web/pnpm-workspace.yaml $D/_dbg/ 2>&1 && echo EXPORT_WS_OK || echo EXPORT_WS_FAIL; "
                     + "cp /root/.dsh/profiles/web/package.json $D/_dbg/ 2>&1 && echo EXPORT_PKG_OK || echo EXPORT_PKG_FAIL; "
                     + "cp /root/.dsh/profiles/web/.npmrc $D/_dbg/ 2>&1 && echo EXPORT_NPMRC_OK || echo EXPORT_NPMRC_FAIL; "
+                    /* ★★★ 2026-10-20：**Android 能力桥连通性自检**。
+                       这是唯一可信的判据 —— 只有真的从**容器内**发起连接
+                       才能证明「抽象 socket 能穿过 proot」，在 adb shell 里测全是假阴性。
+                       期望输出：BRIDGE_PING=pong */
+                    + "echo ---BRIDGE---; "
+                    + "if command -v dsh-android >/dev/null 2>&1; then "
+                    + "  echo BRIDGE_CLI_FOUND; "
+                    + "  echo BRIDGE_PING=$(dsh-android ping 2>&1); "
+                    + "  echo BRIDGE_BATTERY=$(dsh-android battery 2>&1); "
+                    + "  echo BRIDGE_DEVICE=$(dsh-android device 2>&1); "
+                    + "  echo BRIDGE_CLIPSET=$(dsh-android clipboard-set 'bridgetest-'$(date +%s) 2>&1); "
+                    + "  echo BRIDGE_CLIPGET=$(dsh-android clipboard-get 2>&1); "
+                    + "  echo BRIDGE_VIBRATE=$(dsh-android vibrate 120 2>&1); "
+                    + "  echo BRIDGE_TOAST=$(dsh-android toast 'DSH 桥测试' 2>&1); "
+                    + "  echo BRIDGE_NOTIFY=$(dsh-android notify 'DSH 桥' '通知能力测试' 2>&1); "
+                    /* ★ 2026-10-20 新增能力的自检 */
+                    + "  echo BRIDGE_PERMS=$(dsh-android perms 2>&1); "
+                    + "  echo BRIDGE_SENSORS=$(dsh-android sensors 2>&1 | head -c 120); "
+                    + "  echo BRIDGE_APPS=$(dsh-android apps 2>&1 | head -c 80); "
+                    + "  echo BRIDGE_TTS=$(dsh-android tts 'test' 2>&1); "
+                    + "  echo BRIDGE_LOC=$(dsh-android location 2>&1 | head -c 100); "
+                    + "  echo BRIDGE_ADB=$(dsh-android adb status 2>&1); "
+                    + "else echo BRIDGE_CLI_MISSING; fi; "
                     + "echo CONTAINER_LS_END");
 
             ProcessBuilder pb = new ProcessBuilder(cmd);
@@ -503,5 +540,43 @@ public class DshService extends Service {
 
     private void updateNotification(String title, String text) {
         nm.notify(CH_NOTIFY_ID, buildNotification(title, text));
+    }
+
+    /* ★★★ 2026-10-20：给 API 桥用的「发一条通知」。
+     * 与 updateNotification 的区别：用**独立的通知 id**，
+     * 这样容器内发的消息不会覆盖掉"服务已就绪"那条常驻通知。 */
+    private static final int CH_API_NOTIFY_ID = 1001;
+    private static int apiNotifySeq = 1001;
+
+    static void notifyExternal(Context c, String title, String body) {
+        try {
+            android.app.NotificationManager m = (android.app.NotificationManager)
+                    c.getSystemService(Context.NOTIFICATION_SERVICE);
+            if (m == null) return;
+            ensureApiChannel(c, m);
+            int id = ++apiNotifySeq;
+            android.app.Notification n = new NotificationCompat.Builder(c, CH_API)
+                    .setSmallIcon(android.R.drawable.stat_notify_chat)
+                    .setContentTitle(title == null || title.isEmpty() ? "DSH" : title)
+                    .setContentText(body == null ? "" : body)
+                    .setStyle(new NotificationCompat.BigTextStyle().bigText(body == null ? "" : body))
+                    .setPriority(NotificationCompat.PRIORITY_DEFAULT)
+                    .setAutoCancel(true)
+                    .build();
+            m.notify(id, n);
+        } catch (Throwable t) {
+            android.util.Log.w("DshNotify", "notifyExternal 失败: " + t);
+        }
+    }
+
+    private static final String CH_API = "dsh_api_msg";
+
+    private static void ensureApiChannel(Context c, android.app.NotificationManager m) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            android.app.NotificationChannel ch = new android.app.NotificationChannel(
+                    CH_API, "来自容器内的消息", android.app.NotificationManager.IMPORTANCE_DEFAULT);
+            ch.setDescription("DSH 在容器里调用通知能力时使用");
+            m.createNotificationChannel(ch);
+        }
     }
 }
