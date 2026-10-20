@@ -223,7 +223,7 @@ final class RootfsInstaller {
      * 而 APK 升级时插件源码可能已经换了 ⇒ 不重装就还是旧的。
      * 踩过：改完 bug 出了新包，装上却还是老行为，因为判定"已装好"直接跳过了。
      */
-    static final int ADAPT_BUILD = 31;
+    static final int ADAPT_BUILD = 33;
     static final String ADAPT_STAMP = ".adapt-build";
 
     static File adaptDir(Context c) { return new File(Cfg.rootfs(c), ADAPT_DIR); }

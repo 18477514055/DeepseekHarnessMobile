@@ -1143,28 +1143,13 @@ html[data-dsh-seat-tray="open"] #dsh-st-panel { display: flex; }
       };
     } catch (e) {}
 
-    function startUpdateDownload(d) {
-      try {
-        var b = document.getElementById("dsh-mobile-update");
-        if (!b) {
-          b = document.createElement("button");
-          b.id = "dsh-mobile-update";
-          b.type = "button";
-          document.body.appendChild(b);
-        }
-        b.disabled = true;
-        b.textContent = "\u23f3 \u6b63\u5728\u4e0b\u8f7d v" + (d.versionName || "") + "\u2026";
-        /* 交给 App 的 DownloadListener：下载完成后自动拉起系统安装器 */
-        location.href = "/dsh-update.apk";
-      } catch (e) {}
-    }
+    /* ★★★ 2026-10-20 删除 startUpdateDownload()。
+       它做的是 `location.href = "/dsh-update.apk"`，靠 **Termux 外壳的 DownloadListener**
+       去接住并拉起安装器。我们这个容器版没有那条路由、也没有那个 listener
+       ⇒ 点击只会 404。属于和 legacyCheckForUpdate 同一类的「1.6 时代残留」。
+       新流程里下载走窗口顶部给出的 APK 直链（GitHub Release assets），
+       由系统浏览器 / 下载器处理，不依赖外壳。 */
 
-    /**
-     * 点「检查更新」后的流程：
-     *   1) 让原生壳通知 Termux 扫描存储里的安装包（App 自己读不了 /sdcard 的 apk）
-     *   2) 轮询已发布版本，比「已安装」新就自动下载并拉安装器
-     *   3) 约 8 秒仍无新版则提示已是最新
-     */
     /**
      * 点「检查更新」后的流程。
      *
@@ -1197,6 +1182,24 @@ html[data-dsh-seat-tray="open"] #dsh-st-panel { display: flex; }
         if (!err && res) {
           var curSemver = parseVer(cur.name);
           var newer = curSemver ? verNewer(res.version, curSemver) : false;
+          /* ★★★ 2026-10-20：把**判定依据**写进 console（App 会转进 web.log）。
+             起因：用户报「它拿本地那个 1.6 的包去比了」，但我在代码里找不到任何
+             读本地包的路径（window.DshShell 在容器版恒为 undefined、/dsh-version.json
+             从不存在）。⇒ 光靠代码推断说不清，**得让每次检查自己把账摊开**：
+               本地判定的"当前版本"到底是什么、远端拿到的 tag 是什么、谁比谁新。
+             有了这一行，下次再出现"查到 1.6"就能立刻分辨是：
+               ① 我们自己读到了错的值（cur 不对）
+               ② 远端真返回了 1.6（latest 不对）
+               ③ 两个 App 的界面看混了（本 App 日志里根本没有这次调用） */
+          try {
+            console.log("[DSH-DIAG] update-check {curName:" + JSON.stringify(cur.name)
+              + ",curCode:" + (cur.code || 0)
+              + ",latestTag:" + JSON.stringify(res.tag)
+              + ",latestVer:" + JSON.stringify(res.version)
+              + ",newer:" + newer
+              + ",unknownCur:" + (!curSemver)
+              + ",source:" + JSON.stringify(res.source) + "}");
+          } catch (eLog) { }
           showUpdateDialog({
             ok: true,
             newer: newer,
@@ -1209,51 +1212,48 @@ html[data-dsh-seat-tray="open"] #dsh-st-panel { display: flex; }
           return;
         }
 
-        /* 在线源全挂 ⇒ 退回原逻辑：让 App 壳扫本地已下载的安装包 */
+        /* 在线源全挂 ⇒ 如实报告，不再假装检查本地 */
         legacyCheckForUpdate(err);
       });
     }
 
     /**
-     * 兜底：原来的本地扫描逻辑（`/dsh-version.json` + DshShell.checkUpdate）。
-     * ★ 只在在线检查全失败时走这条路，并且**如实告诉用户在线检查失败了**。
+     * 在线检查全失败时的**如实报告**。
+     *
+     * ★★★ 2026-10-20 重写（用户指出：「他检查更新用的是本地的旧的客户端的包，
+     *     我甚至怀疑他根本没去查仓库，而是查本地包了」）：
+     *
+     *   原实现叫 legacyCheckForUpdate，做两件事，**两件都是死的**：
+     *     ① `window.DshShell.checkUpdate()` —— 那是 **Termux 时代外壳（DshShell APK）
+     *        注入的接口**。我们现在这个 com.dsh.mobile 从来没有 addJavascriptInterface，
+     *        所以 window.DshShell 恒为 undefined ⇒ 这行**一个字节的事都没做**。
+     *     ② `fetch("/dsh-version.json")` 扫本地落盘的版本清单 —— **这个文件我们从来
+     *        没提供过**（1.6 那代靠 Termux 侧脚本生成，容器版根本没有）⇒ 每次 404。
+     *
+     *   实际效果：在线检查失败后，它空转 4 次 × 2 秒 = **8 秒**，
+     *   然后弹一句「本地也没找到已下载的新版安装包」——
+     *   对用户就是「查了半天，最后还是翻本地那个包」。
+     *
+     *   ⇒ 现在：**不再假装检查本地**。在线拿不到就立刻如实说"没联网/被挡了"，
+     *     并给出唯一有效的手动路径（去发布页看）。不空转、不看本地、不误导。
      */
     function legacyCheckForUpdate(onlineErr) {
-      try { if (window.DshShell && window.DshShell.checkUpdate) window.DshShell.checkUpdate(); } catch (e) {}
-      var tries = 0;
-      var found = false;
-      var timer = setInterval(function () {
-        tries++;
-        if (tries > 4) {
-          clearInterval(timer);
-          updateBusy = false;
-          if (!found) {
-            showUpdateDialog({
-              ok: false,
-              title: "\u68c0\u67e5\u5931\u8d25",
-              body: "\u5728\u7ebf\u68c0\u67e5\u6ca1\u62ff\u5230\u7ed3\u679c\uff08GitHub \u53ca\u955c\u50cf\u90fd\u4e0d\u53ef\u8fbe\uff09\uff0c\n"
-                  + "\u672c\u5730\u4e5f\u6ca1\u627e\u5230\u5df2\u4e0b\u8f7d\u7684\u65b0\u7248\u5b89\u88c5\u5305\u3002\n\n"
-                  + "\u5e38\u89c1\u539f\u56e0\uff1a\u6ca1\u8054\u7f51 / \u6d41\u91cf\u88ab\u9650 / GitHub \u4e0d\u53ef\u8fbe\n\n"
-                  + (onlineErr && onlineErr.all ? ("\u8be6\u60c5\uff1a\n" + onlineErr.all.join("\n")) : ""),
-              cur: currentVersion()
-            });
-          }
-          return;
+      updateBusy = false;
+      var detail = "";
+      try {
+        if (onlineErr && onlineErr.all && onlineErr.all.length) {
+          detail = "\n\n\u8be6\u60c5\uff1a\n" + onlineErr.all.join("\n");
         }
-        fetch("/dsh-version.json", { cache: "no-store" })
-          .then(function (r) { return r.ok ? r.json() : null; })
-          .then(function (d) {
-            if (!d || !d.versionCode) return;
-            var curCode = window.__DSH_APP_VERSION || 0;
-            if (d.versionCode > curCode) {
-              found = true;
-              clearInterval(timer);
-              updateBusy = false;
-              startUpdateDownload(d);
-            }
-          })
-          .catch(function () {});
-      }, 2000);
+      } catch (e) { }
+      showUpdateDialog({
+        ok: false,
+        title: "\u68c0\u67e5\u5931\u8d25",
+        body: "\u6ca1\u80fd\u8fde\u4e0a GitHub\uff08\u5b98\u65b9 API \u4e0e\u955c\u50cf\u90fd\u4e0d\u53ef\u8fbe\uff09\u3002\n\n"
+            + "\u5e38\u89c1\u539f\u56e0\uff1a\u6ca1\u8054\u7f51 / \u6d41\u91cf\u88ab\u9650 / GitHub \u88ab\u6321\u3002\n"
+            + "\u53ef\u4ee5\u76f4\u63a5\u53bb\u53d1\u5e03\u9875\u770b\u6700\u65b0\u7248\uff0c\u4e0d\u5f71\u54cd\u4f7f\u7528\u3002"
+            + detail,
+        cur: currentVersion()
+      });
     }
 
     /* 原生类名前缀（CSS Modules 哈希），跟着本版本 DSH 走 */
