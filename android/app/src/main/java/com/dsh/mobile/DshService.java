@@ -156,6 +156,31 @@ public class DshService extends Service {
                 Cfg.log(this, "移动端适配插件已就位，跳过");
             }
 
+            /* ★★★ 2026-10-20：**无条件**修 pnpm 的「最小发布年龄」限制。
+             *
+             * 为什么必须放在这里、而不是 installAdapt 里面：
+             *   installAdapt 只在「插件没装好」时才被调用（见上面那个 if）。
+             *   插件早已装好时它整段跳过 ⇒ 补丁永远没机会跑（这个坑刚踩过：
+             *   日志里连一行 pnpm 补丁记录都没有）。
+             *
+             * 要修的问题（用户在手机上装 dsh-ledger-memory 时报的错）：
+             *   Cannot edit "minimumReleaseAgeExclude" in
+             *   "/root/.dsh/profiles/web/pnpm-workspace.yaml": it uses an inline
+             *   YAML value that cannot be edited in place …
+             *   → dsh: plugin command failed; pnpm add -w 'dsh-ledger-memory@1.2.9'
+             *
+             * ⇒ 把 minimumReleaseAge 设 0 并清掉 exclude 字段，
+             *   这样 pnpm 不再产生那个字段，**以后装任何插件都不会再撞这个墙**。
+             *
+             * ★ 但 /root/.dsh 在 Android 侧权限是 000（只有容器内的 root 能忽略），
+             *   所以真正的改写必须**在容器内**用 root 完成 ——
+             *   这里先只负责"调起容器跑一段修正脚本"，见 fixPnpmInContainer()。 */
+            try {
+                RootfsInstaller.fixPnpmWorkspaceBeforeBoot(this);
+            } catch (Throwable t) {
+                Cfg.log(this, "⚠️ pnpm 配置修正失败（不影响启动）: " + t);
+            }
+
             setStatus("启动容器…");
             java.util.List<String> cmd = ProotLauncher.buildCommand(this);
             Cfg.log(this, "cmd = " + String.join(" ", cmd));
@@ -258,12 +283,25 @@ public class DshService extends Service {
                 //   踩过：Cfg.TOKEN 里那条是 Termux 时代的旧令牌，而 DSH 每次启动
                 //   都会生成新 token ⇒ WebView 加载后显示 "dsh web authentication required"。
                 String token = readTokenFromLog();
-                if (token != null) {
+                if (token != null && !token.isEmpty()) {
                     readyUrl = "http://127.0.0.1:" + Cfg.PORT + "/?token=" + token;
                     Cfg.log(this, "就绪，token 已取到");
                 } else {
-                    readyUrl = "http://127.0.0.1:" + Cfg.PORT + "/?token=" + Cfg.TOKEN;
-                    Cfg.log(this, "⚠️ 没从日志里读到 token，回退到常量");
+                    /* ★★★ 2026-10-20：**绝不能用空 token 加载页面**。
+                       踩过（用户报「主界面已经出现了，但各项功能始终不能用」）：
+                       脱敏时把 Cfg.TOKEN 改成了空串，一旦 token 读取失败就会回退到它，
+                       加载出 `?token=`（空）⇒ 页面渲染出来但所有接口 401
+                       ⇒ 用户看到"界面在、功能全废"，且要等好几分钟才有反应。
+                       ⇒ 现在的策略：拿不到 token 就**明确报错**，不加载页面。
+                         这样问题一眼可见，而不是伪装成"能用"。 */
+                    readyUrl = null;
+                    Cfg.log(this, "!!! 没读到 token，拒绝加载页面（避免空 token 的白屏假象）");
+                    setStatus("启动异常：读不到 token，请重开 App");
+                    updateNotification("启动异常", "读不到 token，请重开 App");
+                    running = false;
+                    proc.waitFor();
+                    stopSelf();
+                    return;
                 }
                 running = true;
                 setStatus("已就绪");
@@ -326,6 +364,19 @@ public class DshService extends Service {
                     + "D=" + Cfg.IN_PHONE + "/DeepseekHarness; mkdir -p $D 2>&1; "
                     + "echo 'container-write-'$(date +%s) > $D/_from_container.txt 2>&1 "
                     + "&& cat $D/_from_container.txt || echo WRITE_FAILED; "
+                    /* ★★★ 2026-10-20：把 profile 里的 pnpm 配置文件**导出到共享目录**。
+                       起因：用户在手机上装 dsh-ledger-memory 时 pnpm 报
+                         「Cannot edit "minimumReleaseAgeExclude" … inline YAML value
+                          that cannot be edited in place」
+                       —— 要修就得先看到真实文件内容，而 /root/.dsh 只有容器内能读。
+                       这里每次启动顺手导出一份（很小，几 KB），方便排查。 */
+                    + "mkdir -p $D/_dbg 2>&1; "
+                    + "echo ---DSHHOME---; ls -ld /root/.dsh 2>&1; ls /root/.dsh 2>&1 | head -5; "
+                    + "echo ---ID---; id 2>&1; "
+                    + "echo ---FINDWS---; find /root /data -maxdepth 6 -name 'pnpm-workspace.yaml' 2>/dev/null | head -10; "
+                    + "cp /root/.dsh/profiles/web/pnpm-workspace.yaml $D/_dbg/ 2>&1 && echo EXPORT_WS_OK || echo EXPORT_WS_FAIL; "
+                    + "cp /root/.dsh/profiles/web/package.json $D/_dbg/ 2>&1 && echo EXPORT_PKG_OK || echo EXPORT_PKG_FAIL; "
+                    + "cp /root/.dsh/profiles/web/.npmrc $D/_dbg/ 2>&1 && echo EXPORT_NPMRC_OK || echo EXPORT_NPMRC_FAIL; "
                     + "echo CONTAINER_LS_END");
 
             ProcessBuilder pb = new ProcessBuilder(cmd);
@@ -367,21 +418,43 @@ public class DshService extends Service {
      * 从 files/proot.log 里读本次启动生成的 token。
      * 日志形如：`dsh web: http://127.0.0.1:3080/?token=XXXX`
      * ★ 必须现读，不能写死 —— 每次启动 token 都会变。
+     *
+     * ★★★ 2026-10-20 修（用户报「主界面已经出现了，但各项功能始终不能用」）：
+     *   这里原来**只读一次**。而写 proot.log 的是另一个线程（dsh-log），
+     *   而 {@code probe()} 只要端口能连就返回 true（401 也算"通"）——
+     *   那一刻 token 那一行**可能还没落盘**。
+     *   于是 readTokenFromLog() 读到空 → 返回 null → 回退到 Cfg.TOKEN
+     *   （脱敏后已是空串）→ WebView 加载的 URL **没有 token**
+     *   ⇒ 页面能显示，但所有接口 401 ⇒ 用户看到的就是"界面在、功能全废"。
+     *
+     *   ⇒ 改成**带超时的重试**：最多等 15 秒，每 200ms 重读一次。
+     *     这个等待很短、且只在拿到 token 后才继续，不会拖慢正常启动。
      */
     private String readTokenFromLog() {
         File log = Cfg.prootLog(this);
-        if (!log.exists()) return null;
-        try (BufferedReader r = new BufferedReader(new java.io.FileReader(log))) {
-            String line;
-            java.util.regex.Pattern p =
-                    java.util.regex.Pattern.compile("127\\.0\\.0\\.1:" + Cfg.PORT + "/\\?token=([A-Za-z0-9_-]+)");
-            while ((line = r.readLine()) != null) {
-                java.util.regex.Matcher m = p.matcher(line);
-                if (m.find()) return m.group(1);
+        java.util.regex.Pattern p =
+                java.util.regex.Pattern.compile("127\\.0\\.0\\.1:" + Cfg.PORT + "/\\?token=([A-Za-z0-9_-]+)");
+        long deadline = System.currentTimeMillis() + 15000;   // 最多等 15 秒
+        int tries = 0;
+        while (System.currentTimeMillis() < deadline) {
+            tries++;
+            if (log.exists()) {
+                try (BufferedReader r = new BufferedReader(new java.io.FileReader(log))) {
+                    String line;
+                    while ((line = r.readLine()) != null) {
+                        java.util.regex.Matcher m = p.matcher(line);
+                        if (m.find()) {
+                            if (tries > 1) Cfg.log(this, "token 重试 " + tries + " 次后取到");
+                            return m.group(1);
+                        }
+                    }
+                } catch (Exception e) {
+                    Cfg.log(this, "读 token 失败: " + e.getMessage());
+                }
             }
-        } catch (Exception e) {
-            Cfg.log(this, "读 token 失败: " + e.getMessage());
+            try { Thread.sleep(200); } catch (InterruptedException ie) { break; }
         }
+        Cfg.log(this, "⚠️ 等了 " + tries + " 次（约 15 秒）仍没读到 token");
         return null;
     }
 
