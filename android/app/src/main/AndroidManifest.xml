@@ -116,6 +116,16 @@
             </intent-filter>
         </activity>
 
+        <!-- ★★★ 2026-10-21：独立终端（容器自己的终端，不依附 DSH）。
+             exported=false —— 只允许本 App 内部拉起（启动页按钮 / 设置面板入口），
+             外部应用无法直接把它叫起来，也不构成新的攻击面。 -->
+        <activity
+            android:name=".TerminalActivity"
+            android:exported="false"
+            android:configChanges="orientation|screenSize|keyboardHidden|screenLayout|smallestScreenSize"
+            android:windowSoftInputMode="adjustResize"
+            android:theme="@style/Theme.DshMobile" />
+
         <!-- ★ specialUse：dataSync 在 targetSdk>=35 时后台累计 6 小时会被系统停掉，
              specialUse 没有时长上限。这是保活三件套的第 1 条。 -->
         <service

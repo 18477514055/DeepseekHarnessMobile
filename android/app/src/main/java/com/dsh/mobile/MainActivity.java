@@ -18,6 +18,7 @@ import android.webkit.WebResourceRequest;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
+import android.widget.Button;
 import android.widget.ProgressBar;
 import android.widget.TextView;
 import android.widget.Toast;
@@ -41,9 +42,16 @@ public class MainActivity extends AppCompatActivity {
     private View splash;
     private View webWrap;
     private WebView webView;
+    /** ★ 2026-10-21：启动页的两个入口按钮（用户拍板：不再自动进 DSH）。 */
+    private Button btnDsh;
+    private Button btnTerminal;
 
     private final Handler ui = new Handler(Looper.getMainLooper());
     private boolean webShown = false;
+    /** ★ 2026-10-21：DSH 页面是否**已经加载进 WebView**（与「按钮是否已点亮」是两件事）。 */
+    private boolean webLoaded = false;
+    /** ★ 2026-10-21：当前这次页面加载**是不是真正的 DSH 页面**（决定要不要撤启动页）。 */
+    private volatile boolean loadingDsh = false;
     private long startedAt = 0;
     private static final int REQ_STORAGE = 1001;
     /** 是否已经弹过「所有文件访问」引导（只弹一次，别烦人）。 */
@@ -61,6 +69,21 @@ public class MainActivity extends AppCompatActivity {
         splash = findViewById(R.id.splash);
         webWrap = findViewById(R.id.webWrap);
         webView = findViewById(R.id.webView);
+        btnDsh = findViewById(R.id.btnDsh);
+        btnTerminal = findViewById(R.id.btnTerminal);
+
+        /* ★★★ 2026-10-21（用户拍板）：
+         *   「启动页一进来就给两个按钮，DSH 按钮在解压完之前显示进度、不可点，
+         *     **终端按钮随时能点**。」
+         *   ⇒ DSH 按钮初始 disabled（布局里已是），由 setDshButtonReady 点亮；
+         *     终端按钮**永远可点** —— 终端不依赖 rootfs 解压，
+         *     PtySession.start() 若发现还没解压会给出明确提示，而不是卡住。 */
+        if (btnDsh != null) {
+            btnDsh.setOnClickListener(v -> enterDsh());
+        }
+        if (btnTerminal != null) {
+            btnTerminal.setOnClickListener(v -> openTerminal());
+        }
 
         WebSettings s = webView.getSettings();
         s.setJavaScriptEnabled(true);
@@ -94,6 +117,23 @@ public class MainActivity extends AppCompatActivity {
             @Override
             public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest req) {
                 Uri u = req.getUrl();
+
+                /* ★★★ 2026-10-21：设置面板里的「终端」入口 → 原生终端页。
+                 *
+                 * 为什么走自定义 scheme 而不是 addJavascriptInterface：
+                 *   MainActivity.java 里早就写明「后者会把一个 Java 对象暴露给
+                 *   任意页面脚本，是已知的高危面」，本项目一路回避它。
+                 *   而 location.assign('dshterm://open') 会进到这里，
+                 *   我们截住即可 —— 页面始终拿不到任何 Java 对象。
+                 * ★ 只认 host=open，别的 dshterm:// 一概忽略（不给它当通用跳板）。 */
+                if ("dshterm".equals(u.getScheme())) {
+                    if ("open".equals(u.getHost())) {
+                        Cfg.log(MainActivity.this, "[TERM] 页面请求打开终端");
+                        openTerminal();
+                    }
+                    return true;
+                }
+
                 // 只允许本机；外链交给系统浏览器
                 if ("127.0.0.1".equals(u.getHost()) || "localhost".equals(u.getHost())) return false;
                 try {
@@ -114,6 +154,20 @@ public class MainActivity extends AppCompatActivity {
             public void onPageStarted(WebView v, String url, android.graphics.Bitmap fav) {
                 Cfg.log(MainActivity.this,
                         "PAGE_START url=" + url.replaceAll("token=[^&]+", "token=***"));
+
+                /* ★★★ 2026-10-21（真机踩到，必须判这一条）：
+                 *
+                 * 「进入 DSH」按钮点不动 —— 因为 splash（两个按钮就在它里面）被撤了，
+                 * 而 WebView 盖在最上层。根因：
+                 *   1. 启动页现在**不再自动加载 DSH**，但会调 warmUpWebView() 预热渲染进程；
+                 *   2. 预热是 `loadDataWithBaseURL(...)`，它**同样触发 onPageStarted**；
+                 *   3. 而这里原来**无条件** revealWeb() ⇒ 预热那次就把启动页撤了。
+                 * ⇒ 判据：**只有真正加载 DSH 页面时才撤启动页**。
+                 *   `loadingDsh == true` 由 loadDshPage() 置位，是唯一入口。 */
+                if (!loadingDsh) {
+                    Cfg.log(MainActivity.this, "PAGE_START 是预热页，启动页保持不动");
+                    return;
+                }
 
                 /* ★★★ 2026-10-20（修「检查更新永远查不出新版本」）：
                    插件的 currentVersion() 读 window.__DSH_APP_VERSION /
@@ -440,8 +494,76 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void showWeb(String url) {
-        if (webShown) return;
-        webShown = true;
+        /* ★★★ 2026-10-21（用户拍板）：**不再自动进 DSH**。
+         *
+         * 用户原话：「建议就是 APP 启动后**并不马上进入主界面**，而是主界面显示
+         * **两个按钮**，一个按钮是进入 dsh，另外一个按钮是进入终端。」
+         *
+         * ⇒ 这里不再 loadUrl，只把「DSH 已就绪」记下来 + 把按钮点亮；
+         *   真正加载发生在用户点「进入 DSH」时（enterDsh()）。
+         * ★ 但 WebView **不要** loadUrl("about:blank") —— 渲染进程冷启动要 8~9 秒，
+         *   提前把它热起来，用户点按钮时才不用再等（§74 那次的教训）。
+         *   这里用一个几乎空白的本地页把渲染进程预热。 */
+        dshReadyUrl = url;
+        setDshButtonReady(true);
+        warmUpWebView();
+    }
+
+    /** DSH 就绪后拿到的带 token 的 URL；null 表示还没好。 */
+    private String dshReadyUrl;
+
+    /** 预热 WebView 渲染进程（不加载真实页面，避免用户没点就先进去）。 */
+    private void warmUpWebView() {
+        ui.post(() -> {
+            if (webLoaded) return;
+            try {
+                webView.loadDataWithBaseURL(null,
+                        "<!doctype html><meta charset=utf-8><title>.</title>"
+                                + "<body style='background:#fff'></body>",
+                        "text/html", "utf-8", null);
+            } catch (Throwable ignored) { }
+        });
+    }
+
+    /** 点亮 / 置灰「进入 DSH」按钮。 */
+    private void setDshButtonReady(boolean ready) {
+        ui.post(() -> {
+            if (btnDsh == null) return;
+            btnDsh.setEnabled(ready);
+            btnDsh.setText(ready ? "进入 DSH" : "进入 DSH（准备中…）");
+        });
+    }
+
+    /** 用户点了「进入 DSH」。 */
+    private void enterDsh() {
+        String url = dshReadyUrl != null ? dshReadyUrl : DshService.readyUrl;
+        if (url == null || url.isEmpty()) {
+            statusText.setText("DSH 还没准备好，请稍候…");
+            return;
+        }
+        loadDshPage(url);
+    }
+
+    /* ★★★ 2026-10-21：打开**独立终端**（容器自己的终端，不经过 DSH）。
+     *
+     * 用户原话：「**Dsh 只是我们这个游戏中的一个程序**。我想要的一个终端是
+     *  **独立控制这个容器**。」⇒ 它是一个正常 Activity，不依赖 web 起没起来。
+     * ★ 这里不做「等 rootfs 解压完」的判断 —— 交给 PtySession.start() 去报，
+     *   因为它能给出更准确的话（"还没解压好" vs "共享目录不可用"）。 */
+    private void openTerminal() {
+        try {
+            startActivity(new Intent(this, TerminalActivity.class));
+        } catch (Throwable t) {
+            Cfg.log(this, "[TERM] 打不开终端页: " + t);
+            Toast.makeText(this, "打不开终端：" + t.getMessage(), Toast.LENGTH_LONG).show();
+        }
+    }
+
+    /** 真正把 DSH 页面加载进 WebView，并让 splash 退场。 */
+    private void loadDshPage(String url) {
+        if (webLoaded) return;
+        webLoaded = true;
+        loadingDsh = true;          // ★ 只有这一次才允许 onPageStarted 撤启动页
         progress.setIndeterminate(false);
         progress.setProgress(100);
 

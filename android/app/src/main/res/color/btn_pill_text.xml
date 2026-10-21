@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- ★ 2026-10-21：按钮文字颜色随可用状态变（配合 btn_pill 的灰底）。
+     禁用时用灰字，一眼看出不能点。 -->
+<selector xmlns:android="http://schemas.android.com/apk/res/android">
+    <item android:state_enabled="false" android:color="#FF9CA3AF" />
+    <item android:color="#FF1A1A1A" />
+</selector>

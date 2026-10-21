@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- ★ 2026-10-21：启动页按钮背景（用户要求「做得圆润一点，能看出来这是个按钮」）。
+     用 shape 而不是 Button 默认背景：默认背景在部分 ROM 上被 AppCompat 的
+     backgroundTint 覆盖，颜色会不受控。这里直接给实色 + 圆角 + 极轻描边，
+     既看得出是按钮，又不会太抢眼。 -->
+<selector xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- 可点：实心浅蓝白 + 蓝边 -->
+    <item android:state_enabled="true" android:state_pressed="false">
+        <shape android:shape="rectangle">
+            <solid android:color="#FFF5F7FF" />
+            <stroke android:width="1.5dp" android:color="#FF4D6BFE" />
+            <corners android:radius="26dp" />
+        </shape>
+    </item>
+
+    <!-- 按下：蓝底白字由 textColor 的 selector 处理，这里只加深底色 -->
+    <item android:state_enabled="true" android:state_pressed="true">
+        <shape android:shape="rectangle">
+            <solid android:color="#FFE3E8FF" />
+            <stroke android:width="1.5dp" android:color="#FF3B57E0" />
+            <corners android:radius="26dp" />
+        </shape>
+    </item>
+
+    <!-- 不可点（DSH 还没解压完）：灰底灰边，一眼看出"现在不能点" -->
+    <item android:state_enabled="false">
+        <shape android:shape="rectangle">
+            <solid android:color="#FFF3F4F6" />
+            <stroke android:width="1.5dp" android:color="#FFD1D5DB" />
+            <corners android:radius="26dp" />
+        </shape>
+    </item>
+
+</selector>

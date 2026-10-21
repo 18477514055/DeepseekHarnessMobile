@@ -85,5 +85,58 @@
             android:gravity="center"
             android:textColor="#FF9CA3AF"
             android:textSize="12sp" />
+
+        <!-- ★★★ 2026-10-21：两个入口（用户拍板）。
+             「不强迫别人同时下载几个 apk」⇒ 终端打进同一个包；
+             「启动后并不马上进入主界面」⇒ 这里是选择页，不是自动跳转页。
+
+             ★ 终端按钮**一开始就可点**：终端不依赖 rootfs 解压
+               （PtySession.start() 会先检查 isInstalled，没解压好会给出明确提示），
+               而 DSH 按钮必须等解压完 —— 所以它先置灰、显示进度文案。
+
+             ★★★ 2026-10-21 用户追加要求（原话）：
+               「按钮可以缩小一点，**字不用缩小**，就是这个按钮范围可以缩小一点，
+                然后做的**圆润**一点，然后**能看出来这是个按钮**就可以了。」
+               ⇒ 高度 52dp→46dp、不再 match_parent 撑满，改成 wrap_content + 左右留白，
+                 圆角 26dp（≈ 高度一半，胶囊形），加 1.5dp 描边（"看得出是按钮"）。
+               ★ 字号保持 16sp **不动** —— 用户明确说"字不用缩小"。
+               ★ 用 background=@drawable/btn_pill（shape selector）+ textColor=@color/btn_pill_text，
+                 不用 backgroundTint —— 后者依赖 AppCompat 主题，本 Activity 用平台主题，
+                 在部分 ROM 上完全不生效（本项目已踩过）。 -->
+        <Button
+            android:id="@+id/btnDsh"
+            android:layout_width="wrap_content"
+            android:layout_height="46dp"
+            android:layout_marginTop="26dp"
+            android:minWidth="150dp"
+            android:paddingStart="28dp"
+            android:paddingEnd="28dp"
+            android:insetTop="0dp"
+            android:insetBottom="0dp"
+            android:enabled="false"
+            android:text="进入 DSH"
+            android:textSize="16sp"
+            android:textAllCaps="false"
+            android:stateListAnimator="@null"
+            android:background="@drawable/btn_pill"
+            android:textColor="@color/btn_pill_text" />
+
+        <Button
+            android:id="@+id/btnTerminal"
+            android:layout_width="wrap_content"
+            android:layout_height="46dp"
+            android:layout_marginTop="12dp"
+            android:minWidth="150dp"
+            android:paddingStart="28dp"
+            android:paddingEnd="28dp"
+            android:insetTop="0dp"
+            android:insetBottom="0dp"
+            android:enabled="true"
+            android:text="打开终端"
+            android:textSize="16sp"
+            android:textAllCaps="false"
+            android:stateListAnimator="@null"
+            android:background="@drawable/btn_pill"
+            android:textColor="@color/btn_pill_text" />
     </LinearLayout>
 </FrameLayout>

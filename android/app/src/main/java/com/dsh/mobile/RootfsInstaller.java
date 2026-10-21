@@ -45,14 +45,47 @@ final class RootfsInstaller {
 
     private RootfsInstaller() {}
 
+    /**
+     * ★★★ 2026-10-21：**rootfs 内容版本号**。
+     *
+     * 为什么必须有：{@link #isInstalled} 原来只看「marker 存在 + 几个文件在」——
+     * 那么**已经装过旧 rootfs 的用户永远不会拿到新内容**，因为 marker 一直在。
+     * ⇒ 1.0.5 给 rootfs 加了 `vim`/`nano`/`tmux`/`jq`/`rg`/`unzip`/`file`/`curl`/`less`
+     *   （82,392 → **85,710** 条目），若不加这道戳，**只有全新安装的人才有这些命令**，
+     *   老用户升级后仍然没有 —— 这是最容易「发了版但等于没发」的坑。
+     *
+     * 版本历史：
+     *   - （无戳，marker 内容 `ok`）  初版，82,392 条目
+     *   - **2**  1.0.5：加入 CLI 工具，85,710 条目
+     *
+     * ★ 改动这个数 = 已装用户下次启动会**重新解压整个 rootfs**（手机上约 1~3 分钟）。
+     *   只在 rootfs 资产真的变了时才改它。
+     */
+    static final int ROOTFS_BUILD = 2;
+
     static boolean isInstalled(Context c) {
         File rf = Cfg.rootfs(c);
-        return Cfg.readyMarker(c).exists()
-                && new File(rf, "opt/node/bin/node").exists()
-                && new File(rf, "usr/bin/python3").exists()
-                // ★ 是 usr/bin/sh，不是 bin/sh —— `bin` 本身是符号链接（-> usr/bin）。
-                //   这一条是 tools/verify-tar.js 在电脑上测出来的，省了一次真机往返。
-                && new File(rf, "usr/bin/sh").exists();
+        if (!Cfg.readyMarker(c).exists()) return false;
+        if (!new File(rf, "opt/node/bin/node").exists()) return false;
+        if (!new File(rf, "usr/bin/python3").exists()) return false;
+        // ★ 是 usr/bin/sh，不是 bin/sh —— `bin` 本身是符号链接（-> usr/bin）。
+        //   这一条是 tools/verify-tar.js 在电脑上测出来的，省了一次真机往返。
+        if (!new File(rf, "usr/bin/sh").exists()) return false;
+
+        /* ★ 版本戳比对：内容是 ROOTFS_BUILD 才算装好。
+         * 旧版的 marker 内容是 "ok"，与数字对不上 ⇒ 自动判定为「需要重装」。
+         * 读失败时**返回 false**（宁可重装一次，也不要让用户拿到半旧的 rootfs）。 */
+        try {
+            String stamp = readText(Cfg.readyMarker(c), 64).trim();
+            if (!String.valueOf(ROOTFS_BUILD).equals(stamp)) {
+                Cfg.log(c, "rootfs 版本不符（标记=" + stamp + "，期望=" + ROOTFS_BUILD + "）⇒ 将重新解压");
+                return false;
+            }
+        } catch (Throwable t) {
+            Cfg.log(c, "⚠️ 读 rootfs 版本标记失败，按未安装处理: " + t);
+            return false;
+        }
+        return true;
     }
 
     // ------------------------------------------------------------------
@@ -223,7 +256,7 @@ final class RootfsInstaller {
      * 而 APK 升级时插件源码可能已经换了 ⇒ 不重装就还是旧的。
      * 踩过：改完 bug 出了新包，装上却还是老行为，因为判定"已装好"直接跳过了。
      */
-    static final int ADAPT_BUILD = 35;
+    static final int ADAPT_BUILD = 40;
     static final String ADAPT_STAMP = ".adapt-build";
 
     static File adaptDir(Context c) { return new File(Cfg.rootfs(c), ADAPT_DIR); }
@@ -1369,9 +1402,12 @@ final class RootfsInstaller {
         }
 
         try (FileOutputStream fos = new FileOutputStream(ready)) {
-            fos.write("ok\n".getBytes());
+            /* ★ 2026-10-21：marker 内容从 "ok" 改成 **ROOTFS_BUILD 数字**。
+             * isInstalled() 会比对它 ⇒ 以后 rootfs 内容变了只需改 ROOTFS_BUILD，
+             * 老用户下次启动就会自动重解压。 */
+            fos.write((ROOTFS_BUILD + "\n").getBytes());
         }
-        Cfg.log(c, "解压完成，条目=" + entries);
+        Cfg.log(c, "解压完成，条目=" + entries + "，rootfs 版本=" + ROOTFS_BUILD);
     }
 
     private static void extract(File rootfs, TarReader.Entry e, TarReader tar) throws IOException {

@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<title>终端</title>
+<link rel="stylesheet" href="xterm.css">
+<style>
+  /* ★ 2026-10-21 独立终端：整屏只放一个 xterm，没有标题栏/侧栏。
+     配色跟官方 web 的浅色主题对齐，但终端默认用深色（长期盯着更舒服，也和 Termux 一致）。 */
+  html, body {
+    margin: 0; padding: 0; width: 100%; height: 100%;
+    background: #1E1E1E; overflow: hidden;
+    -webkit-text-size-adjust: 100%;
+    -webkit-tap-highlight-color: transparent;
+  }
+  #wrap {
+    position: absolute; inset: 0;
+    padding: env(safe-area-inset-top) 0 env(safe-area-inset-bottom) 0;
+    box-sizing: border-box;
+  }
+  #term { width: 100%; height: 100%; }
+
+  /* 连上之前盖一层「正在启动容器…」，避免用户看到纯空白以为卡死 */
+  #boot {
+    position: absolute; inset: 0; display: flex;
+    align-items: center; justify-content: center;
+    flex-direction: column; gap: 14px;
+    background: #1E1E1E; color: #C9D1D9;
+    font: 14px/1.5 -apple-system, "Noto Sans CJK SC", sans-serif;
+    z-index: 10;
+  }
+  #boot .msg { opacity: .85; }
+  #boot .sub { font-size: 12px; opacity: .5; max-width: 80%; text-align: center; }
+  #boot.gone { display: none; }
+
+  /* ★ 键盘工具条：手机上软键盘打不出 Ctrl/Esc/| 这些，和 DSH 侧栏终端里那个是同一思路。
+     用 pointerdown 而不是 click —— click 在软键盘弹起/收起时会丢事件。 */
+  #keybar {
+    position: absolute; left: 0; right: 0; bottom: 0;
+    display: flex; gap: 6px; padding: 6px 8px;
+    background: #252526; border-top: 1px solid #333;
+    overflow-x: auto; overflow-y: hidden;
+    -webkit-overflow-scrolling: touch;
+    z-index: 9;
+  }
+  #keybar::-webkit-scrollbar { display: none; }
+  #keybar button {
+    flex: 0 0 auto; min-width: 42px; height: 34px;
+    padding: 0 10px; border-radius: 6px;
+    border: 1px solid #3C3C3C; background: #333333; color: #D4D4D4;
+    font: 13px/1 -apple-system, monospace;
+    -webkit-user-select: none; user-select: none;
+  }
+  #keybar button:active { background: #4A4A4A; }
+</style>
+</head>
+<body>
+<div id="wrap"><div id="term"></div></div>
+
+<div id="keybar">
+  <button data-k="esc">Esc</button>
+  <button data-k="ctrl">Ctrl</button>
+  <button data-k="tab">Tab</button>
+  <button data-k="up">↑</button>
+  <button data-k="down">↓</button>
+  <button data-k="left">←</button>
+  <button data-k="right">→</button>
+  <button data-k="pipe">|</button>
+  <button data-k="dash">-</button>
+  <button data-k="slash">/</button>
+  <button data-k="tilde">~</button>
+  <button data-k="ctrl-c">^C</button>
+  <button data-k="ctrl-d">^D</button>
+  <button data-k="paste">粘贴</button>
+</div>
+
+<div id="boot">
+  <div class="msg" id="bootMsg">正在启动容器…</div>
+  <div class="sub" id="bootSub">首次启动需要解压运行环境，可能要一会儿</div>
+</div>
+
+<script src="xterm.js"></script>
+<script src="addon-fit.js"></script>
+<script>
+/* ★★★ 2026-10-21 独立终端的桥。
+ *
+ * 为什么用 prompt() 而不是 addJavascriptInterface：
+ *   MainActivity.java:131 早就写明「后者会把一个 Java 对象暴露给任意页面脚本，
+ *   是已知的高危面」。本项目刻意一直没用它。
+ *   ⇒ 这里沿用同一个思路：**js → Java** 走 `window.prompt('DSHPty', json)`，
+ *     由 TerminalActivity 的 onJsPrompt 截住；**Java → js** 走 evaluateJavascript
+ *     调本文件暴露的 `window.__ptyOnData(...)` / `__ptyOnExit(...)`。
+ *
+ * 协议（一问一答，全部同步）：
+ *   {op:'start', cols, rows}   起容器 + PTY
+ *   {op:'write', data}         键盘输入 → PTY
+ *   {op:'resize', cols, rows}  终端尺寸变化
+ *   {op:'alive'}               探活（返回 '1' / '0'）
+ *   {op:'stop'}                主动结束
+ * 返回值一律是字符串：ok / 错误文本。
+ */
+(function () {
+  'use strict';
+
+  var BRIDGE = 'DSHPty';
+  var term = null;
+  var fit = null;
+  var started = false;
+
+  function call(payload) {
+    try {
+      var r = window.prompt(BRIDGE, JSON.stringify(payload));
+      return r == null ? '' : String(r);
+    } catch (e) {
+      return 'ERR ' + (e && e.message ? e.message : e);
+    }
+  }
+
+  function bootMsg(m, sub) {
+    var el = document.getElementById('bootMsg');
+    if (el) el.textContent = m;
+    if (sub !== undefined) {
+      var s = document.getElementById('bootSub');
+      if (s) s.textContent = sub;
+    }
+  }
+
+  function bootDone() {
+    var b = document.getElementById('boot');
+    if (b) b.classList.add('gone');
+  }
+
+  /* ---------- 给 Java 侧调用的入口（evaluateJavascript） ---------- */
+
+  /** Java → js：PTY 输出。data 是已经过 JSON 编码的字符串字面量。 */
+  window.__ptyOnData = function (b64OrText) {
+    if (!term) return;
+    try {
+      term.write(b64OrText);
+    } catch (e) { /* 忽略：终端可能已 dispose */ }
+  };
+
+  /** Java → js：进程退出 / 容器挂了。 */
+  window.__ptyOnExit = function (code, reason) {
+    if (!term) return;
+    term.write('\r\n\x1b[33m[终端已结束 code=' + code + (reason ? ' ' + reason : '') + ']\x1b[0m\r\n');
+    started = false;
+  };
+
+  /** Java → js：启动阶段的文案。 */
+  window.__ptyOnStatus = function (m) {
+    if (started) return;
+    bootMsg(m);
+  };
+
+  /* ---------- 键盘工具条 ---------- */
+
+  function sendRaw(s) {
+    if (!started) return;
+    call({ op: 'write', data: s });
+  }
+
+  var CTRL_ARMED = false;
+
+  function setCtrlLabel(on) {
+    var b = document.querySelector('#keybar button[data-k="ctrl"]');
+    if (!b) return;
+    b.style.background = on ? '#4D6BFE' : '';
+    b.style.color = on ? '#fff' : '';
+  }
+
+  document.getElementById('keybar').addEventListener('pointerdown', function (ev) {
+    var btn = ev.target && ev.target.closest ? ev.target.closest('button[data-k]') : null;
+    if (!btn) return;
+    ev.preventDefault();   /* ★ 关键：不 preventDefault 会把焦点从 xterm 抢走，软键盘收起 */
+    var k = btn.getAttribute('data-k');
+
+    if (k === 'ctrl') {
+      CTRL_ARMED = !CTRL_ARMED;
+      setCtrlLabel(CTRL_ARMED);
+      return;
+    }
+    if (k === 'esc')   { sendRaw('\x1b'); return; }
+    if (k === 'tab')   { sendRaw('\t');   return; }
+    if (k === 'up')    { sendRaw('\x1b[A'); return; }
+    if (k === 'down')  { sendRaw('\x1b[B'); return; }
+    if (k === 'right') { sendRaw('\x1b[C'); return; }
+    if (k === 'left')  { sendRaw('\x1b[D'); return; }
+    if (k === 'pipe')  { sendRaw('|');  return; }
+    if (k === 'dash')  { sendRaw('-');  return; }
+    if (k === 'slash') { sendRaw('/');  return; }
+    if (k === 'tilde') { sendRaw('~');  return; }
+    if (k === 'ctrl-c'){ sendRaw('\x03'); return; }
+    if (k === 'ctrl-d'){ sendRaw('\x04'); return; }
+    if (k === 'paste') {
+      /* 读系统剪贴板：由 Java 侧提供（navigator.clipboard 在 file:// 下不可靠） */
+      var t = call({ op: 'clipboard' });
+      if (t && t.indexOf('ERR ') !== 0 && t !== '') {
+        sendRaw(t);
+      }
+      return;
+    }
+    if (CTRL_ARMED && k.length === 1) {
+      /* Ctrl 待发状态：把下一个键转成控制字符 */
+      var code = k.toUpperCase().charCodeAt(0) - 64;
+      if (code >= 1 && code <= 26) sendRaw(String.fromCharCode(code));
+      CTRL_ARMED = false;
+      setCtrlLabel(false);
+    }
+  }, { passive: false });
+
+  /* Ctrl 待发时，键盘上敲的字母也要转成控制字符 */
+  function maybeCtrl(ev) {
+    if (!CTRL_ARMED) return false;
+    var k = ev.key;
+    if (k && k.length === 1) {
+      var code = k.toUpperCase().charCodeAt(0) - 64;
+      if (code >= 1 && code <= 26) {
+        sendRaw(String.fromCharCode(code));
+        CTRL_ARMED = false;
+        setCtrlLabel(false);
+        ev.preventDefault();
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /* ---------- 启动 ---------- */
+
+  function start() {
+    term = new Terminal({
+      cursorBlink: true,
+      fontSize: 14,
+      fontFamily: '"Noto Mono","DejaVu Sans Mono",monospace',
+      scrollback: 5000,
+      allowProposedApi: true,
+      theme: {
+        background: '#1E1E1E', foreground: '#D4D4D4',
+        cursor: '#D4D4D4', selectionBackground: '#264F78'
+      }
+    });
+    fit = new FitAddon.FitAddon();
+    term.loadAddon(fit);
+    term.open(document.getElementById('term'));
+
+    function doFit() {
+      try { fit.fit(); } catch (e) { }
+    }
+    doFit();
+    window.addEventListener('resize', doFit);
+    window.addEventListener('orientationchange', function () {
+      setTimeout(doFit, 250);
+    });
+
+    /* 键盘输入 → PTY。★ onData 拿到的是已经编码好的字节序列，直接透传。 */
+    term.onData(function (d) {
+      if (!started) return;
+      call({ op: 'write', data: d });
+    });
+
+    /* 尺寸变化 → 通知容器里的 PTY（否则 vim/tmux 会按旧尺寸画） */
+    term.onResize(function (sz) {
+      if (!started) return;
+      call({ op: 'resize', cols: sz.cols, rows: sz.rows });
+    });
+
+    /* Ctrl 组合键在 xterm 内部先行拦截（软键盘打不出 Ctrl，用工具条） */
+    term.attachCustomKeyEventHandler(function (ev) {
+      if (ev.type === 'keydown' && maybeCtrl(ev)) return false;
+      return true;
+    });
+
+    var cols = term.cols || 80;
+    var rows = term.rows || 24;
+    var r = call({ op: 'start', cols: cols, rows: rows });
+    if (r === 'ok') {
+      started = true;
+      bootDone();
+      term.focus();
+      /* 启动后再 fit 一次：容器里 bash 起来后提示符宽度才对 */
+      setTimeout(function () { doFit(); }, 400);
+    } else {
+      bootMsg('启动失败', r || '未知错误');
+    }
+  }
+
+  /* 等一帧，让 xterm.js 与 CSS 都到位（file:// 下有时序差异） */
+  if (document.readyState === 'complete') setTimeout(start, 0);
+  else window.addEventListener('load', function () { setTimeout(start, 0); });
+})();
+</script>
+</body>
+</html>

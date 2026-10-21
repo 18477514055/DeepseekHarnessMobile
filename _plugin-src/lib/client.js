@@ -2895,6 +2895,372 @@ html[data-dsh-seat-tray="open"] #dsh-st-panel { display: flex; }
             } catch (e2) {}
         }
     }
+    /* ==========================================================================
+     * ★★★ 2026-10-21（§84）：修「终端卡片点开后卡在『正在读取终端环境…』」
+     *
+     * 真机取证（CDP 读 React fiber，hook #18 = useTerminal 返回值）：
+     *   界面显示「正在读取终端环境…」（一直转）
+     *   真实状态 phase:"loading" / issue:"missingTerminal"
+     *
+     * 根因（官方的，不是我们的）：
+     *   终端进程重启后 host 侧 id 消失了，但 localStorage 里
+     *   `dsh.terminal.binding.v1.[<sessionId>,<contentId>]` 还绑着旧 id
+     *   ⇒ 每次 refresh 都拿到 terminal/unavailable
+     *   ⇒ 官方前端**其实会**渲染「此终端已不存在，请新建终端」+ 新建按钮，
+     *      但那要等一次交互/刷新，手机上看着就像永远卡住。
+     *
+     * 修法：**点终端卡片的那一刻**（捕获阶段）先把旧 binding 清掉。
+     *   ★ 为什么不"先查哪个失效"：查本身要走一次 remote.list（要等待），
+     *     那正是我们要消除的空白期。这里只在「拉起终端」这个动作上清，
+     *     不碰已经在跑的终端 —— 因为也只有这一刻旧 id 才会害人。
+     *   ★ 清的范围：`dsh.terminal.binding.v1.*` 全部。
+     *     代价是「重开终端会新建一个 shell」而不是接管原来的；
+     *     但接管一个已经不存在的进程本来就不可能，这个代价是零。
+     * ========================================================================== */
+    function installTerminalBindingFix() {
+      if (typeof window === 'undefined' || typeof document === 'undefined') return;
+      if (window.__dshTerminalBindingFix) return;
+      window.__dshTerminalBindingFix = true;
+
+      var PREFIX = 'dsh.terminal.binding.v1.';
+
+      function clearStaleBindings(why) {
+        var removed = 0;
+        try {
+          var keys = [];
+          for (var i = 0; i < localStorage.length; i++) {
+            var k = localStorage.key(i);
+            if (k && k.indexOf(PREFIX) === 0) keys.push(k);
+          }
+          for (var j = 0; j < keys.length; j++) {
+            localStorage.removeItem(keys[j]);
+            removed++;
+          }
+        } catch (e) { /* 隐私模式等，忽略 */ }
+        if (removed) {
+          try { diagLog('terminal.binding-cleared', { why: why, count: removed }); } catch (e) {}
+        }
+        return removed;
+      }
+
+      /* ① 点「新建终端」卡片（右侧栏 guide 列表里那张）
+       *    判据用文字 + 位置邻近，不依赖官方 class（那会随版本变）。 */
+      document.addEventListener('click', function (ev) {
+        try {
+          var t = ev.target;
+          if (!t || !t.closest) return;
+          /* 卡片本体：官方在 guide entry 上用 data-sidebar-right-guide-entry，
+             但那是"类型"不是"终端"，所以还是认文字最稳。 */
+          var card = t.closest('[data-sidebar-right-guide-entry]');
+          var txt = '';
+          if (card) txt = (card.textContent || '');
+          /* 也在「此终端已不存在，请新建终端」那个按钮上清一次 */
+          var btn = t.closest('[data-sidebar-terminal] button');
+          if (!card && !btn) return;
+          var hit = /新建终端|终端/.test(txt) || !!btn;
+          if (!hit) return;
+          clearStaleBindings(card ? 'guide-card' : 'new-button');
+        } catch (e) {}
+      }, true);
+
+      /* ② 兜底：终端面板里一旦出现 missingTerminal 的提示文字，
+       *    立刻清 binding 并点一次官方的「新建终端」按钮 —— 用户不用自己找。
+       *    ★ 只在**真的出现那句提示**时动手，不猜状态。 */
+      var lastFix = 0;
+      function sweep() {
+        try {
+          var sec = document.querySelector('[data-sidebar-terminal]');
+          if (!sec) return;
+          var txt = sec.textContent || '';
+          if (txt.indexOf('此终端已不存在') === -1) return;
+          var now = Date.now();
+          if (now - lastFix < 1500) return;   /* 防抖，别和官方渲染打架 */
+          lastFix = now;
+          /* ★ 修：原来要求 cleared>0 才点按钮。但用户手动清过/上次已清过时 cleared=0，
+             于是永远不点 —— 真机就卡在这儿：界面写着「此终端已不存在」，按钮在那儿没人点。
+             ⇒ 看见提示就点；清 binding 是顺手做，不是前提。 */
+          clearStaleBindings('missing-terminal');
+          var b = sec.querySelector('button');
+          if (b) {
+            try { b.click(); } catch (e) {}
+          }
+        } catch (e) {}
+      }
+      try {
+        new MutationObserver(sweep).observe(document.body, { childList: true, subtree: true });
+      } catch (e) {}
+      /* 首次也扫一遍（热重载场景可能已经停在那句提示上） */
+      setTimeout(sweep, 1200);
+
+      try {
+        window.__dshTerminalFix = {
+          clear: clearStaleBindings,
+          keys: function () {
+            var out = [];
+            try {
+              for (var i = 0; i < localStorage.length; i++) {
+                var k = localStorage.key(i);
+                if (k && k.indexOf(PREFIX) === 0) out.push(k);
+              }
+            } catch (e) {}
+            return out;
+          }
+        };
+      } catch (e) {}
+    }
+
+    /* ==========================================================================
+     * ★★★ 2026-10-21（§85）：手机终端键盘工具条
+     *
+     * 用户要求：「这个键盘工具条也加一下」。
+     *
+     * 为什么需要：手机软键盘**打不出** Esc / Tab / Ctrl 组合 / 方向键 / 竖线，
+     * 而 vim、less、tmux、bash 补全全都依赖这些键。官方 xterm 自带一个
+     * `.xterm-helper-textarea`，但它只吃软键盘能产出的字符。
+     *
+     * ═══ 两条硬约束（踩过才知道） ═══
+     * ① **绝不能把焦点从 textarea 抢走** —— 一旦 blur，安卓立刻收起软键盘，
+     *    用户就得再点一次输入区。⇒ 全部用 `pointerdown` + `preventDefault()`，
+     *    **不用 click**（click 太晚，焦点已经跑掉）。
+     * ② **发送字节走 TerminalView 模型的 `write()`**，不要伪造 KeyboardEvent ——
+     *    官方 `xterm.onData(d => model.write(d))` 就是这么走的，
+     *    直接调 write 等价且可靠（CDP 实测过）。
+     * ========================================================================== */
+    function installTerminalKeyBar() {
+      if (typeof window === 'undefined' || typeof document === 'undefined') return;
+      if (window.__dshTerminalKeyBar) return;
+      window.__dshTerminalKeyBar = true;
+
+      var BAR_ID = 'dsh-term-keybar';
+      var ctrlArmed = false;
+
+      /* ---- 从 React fiber 上取到 TerminalView 模型（与 CDP 探测同一条路） ---- */
+      function getModel() {
+        try {
+          var x = document.querySelector('.xterm');
+          if (!x) return null;
+          var n = x;
+          while (n && !Object.keys(n).some(function (y) { return y.indexOf('__reactFiber') === 0; })) {
+            n = n.parentElement;
+          }
+          if (!n) return null;
+          var key = Object.keys(n).filter(function (y) { return y.indexOf('__reactFiber') === 0; })[0];
+          var f = n[key];
+          var guard = 0;
+          while (f && guard++ < 40) {
+            var p = f.memoizedProps;
+            if (p && p.model && typeof p.model.write === 'function') return p.model;
+            f = f.return;
+          }
+        } catch (e) {}
+        return null;
+      }
+
+      /* ---- 发字节：优先走模型，退路是给 textarea 派发 input ---- */
+      function send(data) {
+        var m = getModel();
+        if (m) { try { m.write(data); return true; } catch (e) {} }
+        try {
+          var ta = document.querySelector('.xterm-helper-textarea');
+          if (ta) {
+            ta.value = data;
+            ta.dispatchEvent(new Event('input', { bubbles: true }));
+            ta.value = '';
+            return true;
+          }
+        } catch (e) {}
+        return false;
+      }
+
+      /* ---- 按键表 ---- */
+      var KEYS = [
+        { label: 'Esc',  data: '\x1b' },
+        { label: 'Tab',  data: '\t' },
+        { label: '^C',   data: '\x03', title: 'Ctrl+C 中断' },
+        { label: '^D',   data: '\x04', title: 'Ctrl+D 退出/EOF' },
+        { label: '^Z',   data: '\x1a', title: 'Ctrl+Z 挂起' },
+        { label: '^L',   data: '\x0c', title: 'Ctrl+L 清屏' },
+        { label: '^R',   data: '\x12', title: 'Ctrl+R 历史搜索' },
+        { label: '^A',   data: '\x01', title: 'Ctrl+A 行首' },
+        { label: '^E',   data: '\x05', title: 'Ctrl+E 行尾' },
+        { label: '\u2190', data: '\x1b[D' },
+        { label: '\u2191', data: '\x1b[A' },
+        { label: '\u2193', data: '\x1b[B' },
+        { label: '\u2192', data: '\x1b[C' },
+        { label: '|',    data: '|' },
+        { label: '-',    data: '-' },
+        { label: '/',    data: '/' },
+        { label: '~',    data: '~' },
+        { label: 'Home', data: '\x1b[H' },
+        { label: 'End',  data: '\x1b[F' },
+        { label: 'PgUp', data: '\x1b[5~' },
+        { label: 'PgDn', data: '\x1b[6~' }
+      ];
+
+      /* ---- 样式：一次性注入，不进 CSS 模板串（那里不许出现反引号） ---- */
+      function ensureStyle() {
+        if (document.getElementById(BAR_ID + '-style')) return;
+        var st = document.createElement('style');
+        st.id = BAR_ID + '-style';
+        st.textContent = [
+          '#' + BAR_ID + '{position:fixed;left:0;right:0;bottom:0;z-index:2147483000;',
+          'display:none;gap:4px;padding:6px 6px calc(6px + env(safe-area-inset-bottom,0px));',
+          'background:rgba(24,26,30,.97);backdrop-filter:blur(8px);',
+          'border-top:1px solid rgba(255,255,255,.14);overflow-x:auto;overflow-y:hidden;',
+          '-webkit-overflow-scrolling:touch;white-space:nowrap;}',
+          '#' + BAR_ID + '[data-open="1"]{display:flex;}',
+          '#' + BAR_ID + ' button{flex:0 0 auto;min-width:42px;height:34px;padding:0 9px;',
+          'border-radius:7px;border:1px solid rgba(255,255,255,.2);',
+          'background:rgba(255,255,255,.09);color:#e8eaed;',
+          'font:500 13px/1 ui-monospace,Menlo,Consolas,monospace;',
+          'touch-action:manipulation;user-select:none;-webkit-user-select:none;}',
+          '#' + BAR_ID + ' button:active{background:rgba(255,255,255,.26);}',
+          '#' + BAR_ID + ' button[data-armed="1"]{background:#3b82f6;border-color:#60a5fa;color:#fff;}',
+          '#' + BAR_ID + ' button[data-ctrl="1"]{font-weight:700;}'
+        ].join('');
+        document.head.appendChild(st);
+      }
+
+      /* ---- 建条 ---- */
+      function build() {
+        ensureStyle();
+        var bar = document.getElementById(BAR_ID);
+        if (bar) return bar;
+        bar = document.createElement('div');
+        bar.id = BAR_ID;
+        bar.setAttribute('data-dsh-term-keybar', '1');
+
+        /* Ctrl 是个"待发"开关：点亮后按下一个字母就发 ctrl 码。
+           ★ 手机上没法真的按 Ctrl+字母，所以用这个两段式最实用。 */
+        var ctrlBtn = document.createElement('button');
+        ctrlBtn.type = 'button';
+        ctrlBtn.textContent = 'Ctrl';
+        ctrlBtn.setAttribute('data-ctrl', '1');
+        ctrlBtn.title = '点亮后再按字母 = Ctrl+字母';
+        ctrlBtn.addEventListener('pointerdown', function (ev) {
+          ev.preventDefault(); ev.stopPropagation();
+          ctrlArmed = !ctrlArmed;
+          ctrlBtn.setAttribute('data-armed', ctrlArmed ? '1' : '0');
+        }, { passive: false });
+        bar.appendChild(ctrlBtn);
+
+        for (var i = 0; i < KEYS.length; i++) {
+          (function (k) {
+            var b = document.createElement('button');
+            b.type = 'button';
+            b.textContent = k.label;
+            if (k.title) b.title = k.title;
+            b.addEventListener('pointerdown', function (ev) {
+              ev.preventDefault(); ev.stopPropagation();
+              send(k.data);
+            }, { passive: false });
+            bar.appendChild(b);
+          })(KEYS[i]);
+        }
+
+        /* 右侧「收起」：只隐藏条，不动终端 */
+        var close = document.createElement('button');
+        close.type = 'button';
+        close.textContent = '\u00d7';
+        close.title = '收起工具条';
+        close.addEventListener('pointerdown', function (ev) {
+          ev.preventDefault(); ev.stopPropagation();
+          bar.setAttribute('data-open', '0');
+        bar.setAttribute('data-user-hidden', '1');   /* 只有这里才算用户主动收起 */
+          try {
+            var sec = document.querySelector('[data-sidebar-terminal]');
+            if (sec) sec.style.paddingBottom = '';
+          } catch (e) {}
+        }, { passive: false });
+        bar.appendChild(close);
+
+        document.body.appendChild(bar);
+        return bar;
+      }
+
+      /* ---- Ctrl 两段式的第二段：拦截 textarea 上的字母键 ---- */
+      try {
+        document.addEventListener('keydown', function (ev) {
+          if (!ctrlArmed) return;
+          var t = ev.target;
+          if (!t || t.className === undefined || String(t.className).indexOf('xterm-helper-textarea') === -1) return;
+          var k = ev.key;
+          if (!k || k.length !== 1) return;
+          var code = k.toUpperCase().charCodeAt(0);
+          if (code < 64 || code > 95) return;   /* A-Z 与少数符号 */
+          ev.preventDefault();
+          ev.stopPropagation();
+          var c = String.fromCharCode(code - 64);
+          send(c);
+          ctrlArmed = false;
+          var btn = document.querySelector('#' + BAR_ID + ' button[data-ctrl="1"]');
+          if (btn) btn.setAttribute('data-armed', '0');
+        }, true);
+      } catch (e) {}
+
+      /* ---- 何时显示：终端面板在、且是 xterm 画布才显示 ---- */
+      /* ★★★ 2026-10-21 修：原来只判 querySelector 找不找得到 ⇒ 对话页也显示工具条。
+         真机取证：切回对话页后 [data-sidebar-terminal] 与 .xterm **仍在 DOM 里**，
+         只是被官方隐藏（offsetParent=null / 宽高为 0）。
+         ⇒ 判"在不在 DOM"是错的尺子，必须判"看不看得见"。（§0.2 又一例：能查到 ≠ 能看到） */
+      function visible(el) {
+        if (!el) return false;
+        try {
+          var cs = getComputedStyle(el);
+          if (cs.display === 'none' || cs.visibility === 'hidden' || cs.opacity === '0') return false;
+          var r = el.getBoundingClientRect();
+          if (r.width < 2 || r.height < 2) return false;
+          if (el.offsetParent === null && cs.position !== 'fixed') return false;
+        } catch (e) { return false; }
+        return true;
+      }
+
+      function sync() {
+        try {
+          var sec = null, i;
+          var all = document.querySelectorAll('[data-sidebar-terminal]');
+          for (i = 0; i < all.length; i++) { if (visible(all[i])) { sec = all[i]; break; } }
+          var xtermVisible = false;
+          var xs = document.querySelectorAll('.xterm');
+          for (i = 0; i < xs.length; i++) { if (visible(xs[i])) { xtermVisible = true; break; } }
+          var bar = document.getElementById(BAR_ID);
+          if (!sec || !xtermVisible) {
+            if (bar) bar.setAttribute('data-open', '0');
+            var others = document.querySelectorAll('[data-sidebar-terminal]');
+            for (i = 0; i < others.length; i++) others[i].style.paddingBottom = '';
+            return;
+          }
+          if (!bar) bar = build();
+          /* 修死锁：原来判 data-open === '0' 就 return，
+             而上面「终端暂时不可见」也会把 data-open 设成 0
+             => 一旦切过一次页，工具条就永久回不来。
+             => 只认 data-user-hidden 这个独立标记。 */
+          if (bar.getAttribute('data-user-hidden') === '1') return;
+          bar.setAttribute('data-open', '1');
+          var h = bar.offsetHeight || 46;
+          sec.style.paddingBottom = h + 'px';
+        } catch (e) {}
+      }
+
+      try {
+        new MutationObserver(function () {
+          if (sync._t) return;
+          sync._t = setTimeout(function () { sync._t = null; sync(); }, 120);
+        }).observe(document.body, { childList: true, subtree: true });
+      } catch (e) {}
+      setInterval(sync, 1500);
+      setTimeout(sync, 800);
+
+      try {
+        window.__dshTerminalKeyBarApi = {
+          show: function () { var b = build(); b.removeAttribute('data-user-hidden'); b.setAttribute('data-open', '1'); sync(); },
+          hide: function () { var b = document.getElementById(BAR_ID); if (b) b.setAttribute('data-open', '0'); },
+          send: send,
+          model: getModel
+        };
+      } catch (e) {}
+    }
+
 
     function installUpdateChecker() {
       if (window.__dshUpdateChecker) return;
@@ -5891,6 +6257,8 @@ html[data-dsh-seat-tray="open"] #dsh-st-panel { display: flex; }
   /* ---------------- 挂进官方设置面板 ---------------- */
 
   var NAV_ID = 'dsh-api-nav';
+  /** ★ 2026-10-21：设置面板第一层里、「API 设置」**旁边**的独立终端入口。 */
+  var TERM_NAV_ID = 'dsh-term-nav';
 
   /** 在设置面板的 nav 里插入「API 设置」一项（幂等）。
    *
@@ -5940,8 +6308,55 @@ html[data-dsh-seat-tray="open"] #dsh-st-panel { display: flex; }
       }
 
       console.log('[DSH-API] 已在设置导航插入「API 设置」（位置 2）');
+
+      /* ★★★ 2026-10-21：紧跟着插一个**同级**的「终端」项。
+       *
+       * 用户原话纠正（§92.8）：「不是放进 API 设置，而是**和它并列**，
+       * 也就是放在**设置面板的第一层**。」
+       * ⇒ 它是 nav 里独立的第三项，**不嵌套**进 API 面板的 content 区。
+       * ⇒ 点它不换 content，而是**跳出 WebView** 去拉起原生的 TerminalActivity。
+       *
+       * ★ 为什么用 location.assign('dshterm://open') 而不是 window.open：
+       *   后者会被 WebView 当成新窗口请求（我们没实现 onCreateWindow，直接丢弃）。
+       *   而 location.assign 走的是 shouldOverrideUrlLoading，MainActivity 已经
+       *   在那条分支里放行了「非本机 URL」交给系统 —— 我们只需在那儿截住 dshterm。
+       *   ★ 不用 addJavascriptInterface：MainActivity.java:131 明确标注那是高危面。 */
+      injectTermNav(dlg, nav, tpl, item);
     } catch (e) {
       console.warn('[DSH-API] injectNav 失败', e);
+    }
+  }
+
+  /** 在设置 nav 里插入「终端」项（与「API 设置」同级，位置 3）。幂等。 */
+  function injectTermNav(dlg, nav, tpl, apiItem) {
+    try {
+      if (!dlg || dlg.querySelector('#' + TERM_NAV_ID)) return;
+
+      var item = tpl.cloneNode(true);
+      item.id = TERM_NAV_ID;
+      item.setAttribute('data-dsh-term-nav', '1');
+      item.removeAttribute('aria-current');
+      item.removeAttribute('aria-selected');
+      item.removeAttribute('tabindex');
+      item.className = tpl.className
+        .replace(/\S*(active|selected|current)\S*/gi, '')
+        .replace(/\s+/g, ' ').trim();
+
+      var txt = item.querySelector('span,div');
+      if (txt) txt.textContent = '终端';
+      else item.textContent = '终端';
+
+      // 拼在「API 设置」后面（同级）
+      var ref = apiItem && apiItem.parentNode ? apiItem : null;
+      if (ref) {
+        ref.parentNode.insertBefore(item, ref.nextSibling);
+      } else {
+        nav.appendChild(item);
+      }
+
+      console.log('[DSH-TERM] 已在设置导航插入「终端」（与 API 设置同级）');
+    } catch (e) {
+      console.warn('[DSH-TERM] injectTermNav 失败', e);
     }
   }
 
@@ -6027,343 +6442,6 @@ html[data-dsh-seat-tray="open"] #dsh-st-panel { display: flex; }
     return null;
   }
 
-  /* ==========================================================================
-   * ★★★ 2026-10-21（§84）：修「终端卡片点开后卡在『正在读取终端环境…』」
-   *
-   * 真机取证（CDP 读 React fiber，hook #18 = useTerminal 返回值）：
-   *   界面显示「正在读取终端环境…」（一直转）
-   *   真实状态 phase:"loading" / issue:"missingTerminal"
-   *
-   * 根因（官方的，不是我们的）：
-   *   终端进程重启后 host 侧 id 消失了，但 localStorage 里
-   *   `dsh.terminal.binding.v1.[<sessionId>,<contentId>]` 还绑着旧 id
-   *   ⇒ 每次 refresh 都拿到 terminal/unavailable
-   *   ⇒ 官方前端**其实会**渲染「此终端已不存在，请新建终端」+ 新建按钮，
-   *      但那要等一次交互/刷新，手机上看着就像永远卡住。
-   *
-   * 修法：**点终端卡片的那一刻**（捕获阶段）先把旧 binding 清掉。
-   *   ★ 为什么不"先查哪个失效"：查本身要走一次 remote.list（要等待），
-   *     那正是我们要消除的空白期。这里只在「拉起终端」这个动作上清，
-   *     不碰已经在跑的终端 —— 因为也只有这一刻旧 id 才会害人。
-   *   ★ 清的范围：`dsh.terminal.binding.v1.*` 全部。
-   *     代价是「重开终端会新建一个 shell」而不是接管原来的；
-   *     但接管一个已经不存在的进程本来就不可能，这个代价是零。
-   * ========================================================================== */
-  function installTerminalBindingFix() {
-    if (typeof window === 'undefined' || typeof document === 'undefined') return;
-    if (window.__dshTerminalBindingFix) return;
-    window.__dshTerminalBindingFix = true;
-
-    var PREFIX = 'dsh.terminal.binding.v1.';
-
-    function clearStaleBindings(why) {
-      var removed = 0;
-      try {
-        var keys = [];
-        for (var i = 0; i < localStorage.length; i++) {
-          var k = localStorage.key(i);
-          if (k && k.indexOf(PREFIX) === 0) keys.push(k);
-        }
-        for (var j = 0; j < keys.length; j++) {
-          localStorage.removeItem(keys[j]);
-          removed++;
-        }
-      } catch (e) { /* 隐私模式等，忽略 */ }
-      if (removed) {
-        try { diagLog('terminal.binding-cleared', { why: why, count: removed }); } catch (e) {}
-      }
-      return removed;
-    }
-
-    /* ① 点「新建终端」卡片（右侧栏 guide 列表里那张）
-     *    判据用文字 + 位置邻近，不依赖官方 class（那会随版本变）。 */
-    document.addEventListener('click', function (ev) {
-      try {
-        var t = ev.target;
-        if (!t || !t.closest) return;
-        /* 卡片本体：官方在 guide entry 上用 data-sidebar-right-guide-entry，
-           但那是"类型"不是"终端"，所以还是认文字最稳。 */
-        var card = t.closest('[data-sidebar-right-guide-entry]');
-        var txt = '';
-        if (card) txt = (card.textContent || '');
-        /* 也在「此终端已不存在，请新建终端」那个按钮上清一次 */
-        var btn = t.closest('[data-sidebar-terminal] button');
-        if (!card && !btn) return;
-        var hit = /新建终端|终端/.test(txt) || !!btn;
-        if (!hit) return;
-        clearStaleBindings(card ? 'guide-card' : 'new-button');
-      } catch (e) {}
-    }, true);
-
-    /* ② 兜底：终端面板里一旦出现 missingTerminal 的提示文字，
-     *    立刻清 binding 并点一次官方的「新建终端」按钮 —— 用户不用自己找。
-     *    ★ 只在**真的出现那句提示**时动手，不猜状态。 */
-    var lastFix = 0;
-    function sweep() {
-      try {
-        var sec = document.querySelector('[data-sidebar-terminal]');
-        if (!sec) return;
-        var txt = sec.textContent || '';
-        if (txt.indexOf('此终端已不存在') === -1) return;
-        var now = Date.now();
-        if (now - lastFix < 1500) return;   /* 防抖，别和官方渲染打架 */
-        lastFix = now;
-        var cleared = clearStaleBindings('missing-terminal');
-        var b = sec.querySelector('button');
-        if (b && cleared) {
-          try { b.click(); } catch (e) {}
-        }
-      } catch (e) {}
-    }
-    try {
-      new MutationObserver(sweep).observe(document.body, { childList: true, subtree: true });
-    } catch (e) {}
-    /* 首次也扫一遍（热重载场景可能已经停在那句提示上） */
-    setTimeout(sweep, 1200);
-
-    try {
-      window.__dshTerminalFix = {
-        clear: clearStaleBindings,
-        keys: function () {
-          var out = [];
-          try {
-            for (var i = 0; i < localStorage.length; i++) {
-              var k = localStorage.key(i);
-              if (k && k.indexOf(PREFIX) === 0) out.push(k);
-            }
-          } catch (e) {}
-          return out;
-        }
-      };
-    } catch (e) {}
-  }
-
-  /* ==========================================================================
-   * ★★★ 2026-10-21（§85）：手机终端键盘工具条
-   *
-   * 用户要求：「这个键盘工具条也加一下」。
-   *
-   * 为什么需要：手机软键盘**打不出** Esc / Tab / Ctrl 组合 / 方向键 / 竖线，
-   * 而 vim、less、tmux、bash 补全全都依赖这些键。官方 xterm 自带一个
-   * `.xterm-helper-textarea`，但它只吃软键盘能产出的字符。
-   *
-   * ═══ 两条硬约束（踩过才知道） ═══
-   * ① **绝不能把焦点从 textarea 抢走** —— 一旦 blur，安卓立刻收起软键盘，
-   *    用户就得再点一次输入区。⇒ 全部用 `pointerdown` + `preventDefault()`，
-   *    **不用 click**（click 太晚，焦点已经跑掉）。
-   * ② **发送字节走 TerminalView 模型的 `write()`**，不要伪造 KeyboardEvent ——
-   *    官方 `xterm.onData(d => model.write(d))` 就是这么走的，
-   *    直接调 write 等价且可靠（CDP 实测过）。
-   * ========================================================================== */
-  function installTerminalKeyBar() {
-    if (typeof window === 'undefined' || typeof document === 'undefined') return;
-    if (window.__dshTerminalKeyBar) return;
-    window.__dshTerminalKeyBar = true;
-
-    var BAR_ID = 'dsh-term-keybar';
-    var ctrlArmed = false;
-
-    /* ---- 从 React fiber 上取到 TerminalView 模型（与 CDP 探测同一条路） ---- */
-    function getModel() {
-      try {
-        var x = document.querySelector('.xterm');
-        if (!x) return null;
-        var n = x;
-        while (n && !Object.keys(n).some(function (y) { return y.indexOf('__reactFiber') === 0; })) {
-          n = n.parentElement;
-        }
-        if (!n) return null;
-        var key = Object.keys(n).filter(function (y) { return y.indexOf('__reactFiber') === 0; })[0];
-        var f = n[key];
-        var guard = 0;
-        while (f && guard++ < 40) {
-          var p = f.memoizedProps;
-          if (p && p.model && typeof p.model.write === 'function') return p.model;
-          f = f.return;
-        }
-      } catch (e) {}
-      return null;
-    }
-
-    /* ---- 发字节：优先走模型，退路是给 textarea 派发 input ---- */
-    function send(data) {
-      var m = getModel();
-      if (m) { try { m.write(data); return true; } catch (e) {} }
-      try {
-        var ta = document.querySelector('.xterm-helper-textarea');
-        if (ta) {
-          ta.value = data;
-          ta.dispatchEvent(new Event('input', { bubbles: true }));
-          ta.value = '';
-          return true;
-        }
-      } catch (e) {}
-      return false;
-    }
-
-    /* ---- 按键表 ---- */
-    var KEYS = [
-      { label: 'Esc',  data: '\x1b' },
-      { label: 'Tab',  data: '\t' },
-      { label: '^C',   data: '\x03', title: 'Ctrl+C 中断' },
-      { label: '^D',   data: '\x04', title: 'Ctrl+D 退出/EOF' },
-      { label: '^Z',   data: '\x1a', title: 'Ctrl+Z 挂起' },
-      { label: '^L',   data: '\x0c', title: 'Ctrl+L 清屏' },
-      { label: '^R',   data: '\x12', title: 'Ctrl+R 历史搜索' },
-      { label: '^A',   data: '\x01', title: 'Ctrl+A 行首' },
-      { label: '^E',   data: '\x05', title: 'Ctrl+E 行尾' },
-      { label: '\u2190', data: '\x1b[D' },
-      { label: '\u2191', data: '\x1b[A' },
-      { label: '\u2193', data: '\x1b[B' },
-      { label: '\u2192', data: '\x1b[C' },
-      { label: '|',    data: '|' },
-      { label: '-',    data: '-' },
-      { label: '/',    data: '/' },
-      { label: '~',    data: '~' },
-      { label: 'Home', data: '\x1b[H' },
-      { label: 'End',  data: '\x1b[F' },
-      { label: 'PgUp', data: '\x1b[5~' },
-      { label: 'PgDn', data: '\x1b[6~' }
-    ];
-
-    /* ---- 样式：一次性注入，不进 CSS 模板串（那里不许出现反引号） ---- */
-    function ensureStyle() {
-      if (document.getElementById(BAR_ID + '-style')) return;
-      var st = document.createElement('style');
-      st.id = BAR_ID + '-style';
-      st.textContent = [
-        '#' + BAR_ID + '{position:fixed;left:0;right:0;bottom:0;z-index:2147483000;',
-        'display:none;gap:4px;padding:6px 6px calc(6px + env(safe-area-inset-bottom,0px));',
-        'background:rgba(24,26,30,.97);backdrop-filter:blur(8px);',
-        'border-top:1px solid rgba(255,255,255,.14);overflow-x:auto;overflow-y:hidden;',
-        '-webkit-overflow-scrolling:touch;white-space:nowrap;}',
-        '#' + BAR_ID + '[data-open="1"]{display:flex;}',
-        '#' + BAR_ID + ' button{flex:0 0 auto;min-width:42px;height:34px;padding:0 9px;',
-        'border-radius:7px;border:1px solid rgba(255,255,255,.2);',
-        'background:rgba(255,255,255,.09);color:#e8eaed;',
-        'font:500 13px/1 ui-monospace,Menlo,Consolas,monospace;',
-        'touch-action:manipulation;user-select:none;-webkit-user-select:none;}',
-        '#' + BAR_ID + ' button:active{background:rgba(255,255,255,.26);}',
-        '#' + BAR_ID + ' button[data-armed="1"]{background:#3b82f6;border-color:#60a5fa;color:#fff;}',
-        '#' + BAR_ID + ' button[data-ctrl="1"]{font-weight:700;}'
-      ].join('');
-      document.head.appendChild(st);
-    }
-
-    /* ---- 建条 ---- */
-    function build() {
-      ensureStyle();
-      var bar = document.getElementById(BAR_ID);
-      if (bar) return bar;
-      bar = document.createElement('div');
-      bar.id = BAR_ID;
-      bar.setAttribute('data-dsh-term-keybar', '1');
-
-      /* Ctrl 是个"待发"开关：点亮后按下一个字母就发 ctrl 码。
-         ★ 手机上没法真的按 Ctrl+字母，所以用这个两段式最实用。 */
-      var ctrlBtn = document.createElement('button');
-      ctrlBtn.type = 'button';
-      ctrlBtn.textContent = 'Ctrl';
-      ctrlBtn.setAttribute('data-ctrl', '1');
-      ctrlBtn.title = '点亮后再按字母 = Ctrl+字母';
-      ctrlBtn.addEventListener('pointerdown', function (ev) {
-        ev.preventDefault(); ev.stopPropagation();
-        ctrlArmed = !ctrlArmed;
-        ctrlBtn.setAttribute('data-armed', ctrlArmed ? '1' : '0');
-      }, { passive: false });
-      bar.appendChild(ctrlBtn);
-
-      for (var i = 0; i < KEYS.length; i++) {
-        (function (k) {
-          var b = document.createElement('button');
-          b.type = 'button';
-          b.textContent = k.label;
-          if (k.title) b.title = k.title;
-          b.addEventListener('pointerdown', function (ev) {
-            ev.preventDefault(); ev.stopPropagation();
-            send(k.data);
-          }, { passive: false });
-          bar.appendChild(b);
-        })(KEYS[i]);
-      }
-
-      /* 右侧「收起」：只隐藏条，不动终端 */
-      var close = document.createElement('button');
-      close.type = 'button';
-      close.textContent = '\u00d7';
-      close.title = '收起工具条';
-      close.addEventListener('pointerdown', function (ev) {
-        ev.preventDefault(); ev.stopPropagation();
-        bar.setAttribute('data-open', '0');
-        try {
-          var sec = document.querySelector('[data-sidebar-terminal]');
-          if (sec) sec.style.paddingBottom = '';
-        } catch (e) {}
-      }, { passive: false });
-      bar.appendChild(close);
-
-      document.body.appendChild(bar);
-      return bar;
-    }
-
-    /* ---- Ctrl 两段式的第二段：拦截 textarea 上的字母键 ---- */
-    try {
-      document.addEventListener('keydown', function (ev) {
-        if (!ctrlArmed) return;
-        var t = ev.target;
-        if (!t || t.className === undefined || String(t.className).indexOf('xterm-helper-textarea') === -1) return;
-        var k = ev.key;
-        if (!k || k.length !== 1) return;
-        var code = k.toUpperCase().charCodeAt(0);
-        if (code < 64 || code > 95) return;   /* A-Z 与少数符号 */
-        ev.preventDefault();
-        ev.stopPropagation();
-        var c = String.fromCharCode(code - 64);
-        send(c);
-        ctrlArmed = false;
-        var btn = document.querySelector('#' + BAR_ID + ' button[data-ctrl="1"]');
-        if (btn) btn.setAttribute('data-armed', '0');
-      }, true);
-    } catch (e) {}
-
-    /* ---- 何时显示：终端面板在、且是 xterm 画布才显示 ---- */
-    function sync() {
-      try {
-        var sec = document.querySelector('[data-sidebar-terminal]');
-        var hasXterm = !!document.querySelector('.xterm');
-        var bar = document.getElementById(BAR_ID);
-        if (!sec || !hasXterm) {
-          if (bar) bar.setAttribute('data-open', '0');
-          return;
-        }
-        if (!bar) bar = build();
-        if (bar.getAttribute('data-open') === '0') return;   /* 用户手动收起了 */
-        bar.setAttribute('data-open', '1');
-        /* 给终端留出底部空间，别被条挡住最后一行 */
-        var h = bar.offsetHeight || 46;
-        sec.style.paddingBottom = h + 'px';
-      } catch (e) {}
-    }
-
-    try {
-      new MutationObserver(function () {
-        if (sync._t) return;
-        sync._t = setTimeout(function () { sync._t = null; sync(); }, 120);
-      }).observe(document.body, { childList: true, subtree: true });
-    } catch (e) {}
-    setInterval(sync, 1500);
-    setTimeout(sync, 800);
-
-    try {
-      window.__dshTerminalKeyBarApi = {
-        show: function () { var b = build(); b.setAttribute('data-open', '1'); sync(); },
-        hide: function () { var b = document.getElementById(BAR_ID); if (b) b.setAttribute('data-open', '0'); },
-        send: send,
-        model: getModel
-      };
-    } catch (e) {}
-  }
-
   /* ---------------- 事件接线 ---------------- */
 
   function boot() {
@@ -6380,11 +6458,37 @@ html[data-dsh-seat-tray="open"] #dsh-st-panel { display: flex; }
       ev.stopPropagation();
     }, true);
 
+    /* ①-b ★ 2026-10-21：点「终端」⇒ 跳出 WebView，拉起原生 TerminalActivity。
+     *
+     * 用户原话：「**和它并列**……放在设置面板的第一层」。
+     * ⇒ 它不换 content 区（不是面板页），而是走自定义 scheme。
+     * ★ 必须 stopPropagation：下面 ② 那条分支会把「点 nav 项」当成
+     *   "离开我们的面板 ⇒ 恢复官方内容"，不拦的话会闪一下官方页面。 */
+    document.addEventListener('click', function (ev) {
+      var t = ev.target;
+      if (!t || !t.closest) return;
+      if (!t.closest('#' + TERM_NAV_ID)) return;
+      ev.preventDefault();
+      ev.stopPropagation();
+      // 先把我们自己的面板收起来，避免回来时停在半截状态
+      try {
+        var d = findDialog();
+        if (d && panelEl) hidePanel(d);
+      } catch (e) {}
+      try {
+        // 自定义 scheme 由 MainActivity.shouldOverrideUrlLoading 截住
+        window.location.assign('dshterm://open');
+      } catch (e) {
+        console.warn('[DSH-TERM] 唤起终端失败', e);
+      }
+    }, true);
+
     // ② 点别的 nav 项 ⇒ 收起我们的面板，恢复官方内容
     document.addEventListener('click', function (ev) {
       var t = ev.target;
       if (!t || !t.closest) return;
       if (t.closest('#' + NAV_ID)) return;                 // 我们自己
+      if (t.closest('#' + TERM_NAV_ID)) return;            // 终端项（已单独处理）
       var cell = t.closest('[class*="navCell"]');
       if (!cell) return;
       var dlg = findDialog();
