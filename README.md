@@ -73,9 +73,9 @@ build.cmd release    :: release APK
 
 | 文件 | 大小 | 说明 |
 |---|---|---|
-| `android/app/src/main/assets/rootfs.gz.bin` | 376 MB（394,325,574 B） | Debian rootfs（gzip），解压后 82,392 个条目 |
+| `android/app/src/main/assets/rootfs.gz.bin` | 387 MB（405,987,829 B） | Debian rootfs（gzip），解压后 85,710 个条目 |
 | `android/app/src/main/assets/pnpm-incr.gz.bin` | 22.1 MB（23,219,739 B） | pnpm 二进制增量包 |
-| `android/app/src/main/assets/mobile-adapt.gz.bin` | 124 KB（126,494 B） | 内置移动端插件（由 `_pk.cjs` 生成） |
+| `android/app/src/main/assets/mobile-adapt.gz.bin` | 131 KB（134,575 B） | 内置移动端插件（由 `_pk.cjs` 生成） |
 | `android/app/src/main/assets/使用指南.md` | 8.3 KB | 随包分发的使用指南，启动时复制到共享目录 |
 
 ★ 后缀是 `.gz.bin` 而不是 `.gz` —— **AGP 会自动解压 `.gz`**，把 376 MB 变成 1.3 GB。
@@ -114,8 +114,9 @@ docs/                  实证报告与工程说明
 
 - **不上架**：targetSdk=28 是硬约束。
 - **不做开机自启**：Android 会因此限制应用（这是刻意设计），改为「点开后常驻」。
-- **首次启动要解压 376 MB rootfs**，实测**冷启动 18.4 秒**到页面可用
-  （Android 16 / 1.0.4 实测）。启动期间界面停在启动页，属正常现象。
+- **首次启动要解压 387 MB rootfs**，实测**冷启动 18.4 秒**到页面可用
+  （Android 16 / 1.0.4 实测；1.0.5 起 rootfs 增大到 387 MB，解压时间略增）。
+  启动期间界面停在启动页，属正常现象。
   ★ **开着省电模式时会慢很多**（实测同一台机同一版本 29~96 秒）——
   省电会压低 CPU 频率，而 proot 容器的启动对频率很敏感。
   要稳定在 18 秒左右，请把本应用加入省电白名单，或临时关掉省电。

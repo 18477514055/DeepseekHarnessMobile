@@ -444,6 +444,18 @@ public class MainActivity extends AppCompatActivity {
        用 post 到主线程：onPageStarted 虽在主线程，但兜底调用点可能在别的时机。 */
     private void revealWeb() {
         ui.post(() -> {
+            /* ★★★ 2026-10-21（修「插件页 / 自动化任务页 / 插件市场页按返回键直接退到桌面」）：
+             *
+             *   `webShown` 这个字段**只有声明和读取，从来没有被赋过 true**
+             *   ⇒ `onBackPressed()` 第一行 `if (!webShown …) { moveTaskToBack(true); return; }`
+             *     永远命中 ⇒ **插件的 `window.__dshBack()` 从来没被调用过**。
+             *   而插件侧逻辑本身是好的（真机实测：在插件面板上调 `__dshBack()` 返回 true）。
+             *
+             *   ⇒ 这是 1.0.5 重构 `showWeb()`（不再自动进 DSH）时丢掉的置位。
+             *     现在收口到「DSH 页面真正可见」这一刻 —— 也就是本方法。
+             *   ★ 必须放在 revealWeb 而不是 showWeb：showWeb 阶段页面还没出来，
+             *     那时按返回本来就该退到后台。 */
+            webShown = true;
             if (splash != null && splash.getVisibility() != View.GONE) {
                 splash.setVisibility(View.GONE);
                 Cfg.log(this, "revealWeb 已撤启动页（t=" + System.currentTimeMillis() + "）");
@@ -564,6 +576,10 @@ public class MainActivity extends AppCompatActivity {
         if (webLoaded) return;
         webLoaded = true;
         loadingDsh = true;          // ★ 只有这一次才允许 onPageStarted 撤启动页
+        /* ★★★ 2026-10-21：用户已经点了「进入 DSH」，从这一刻起返回键就该问插件
+         *   （页面加载要 5~9 秒，这段窗口里按返回不该直接退到桌面）。
+         *   ★ 若此刻 __dshBack 还没注入，JS 会返回 '0'，仍然安全地退到后台。 */
+        webShown = true;
         progress.setIndeterminate(false);
         progress.setProgress(100);
 

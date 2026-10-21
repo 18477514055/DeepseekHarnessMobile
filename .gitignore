@@ -48,6 +48,15 @@ _ledger-archive/
 _ledger-log/
 _stash/
 _handoff/
+# ★ 2026-10-21 补：根目录下的**散件**记忆文件（带后缀 / 备份名），
+#   例如 LEDGER-archive.md —— 上面那些是精确文件名，漏了这种变体。
+#   漏掉的后果很严重：它不被追踪、也不被忽略 ⇒ 将来一次 `git add -A` 就带上去。
+LEDGER*.md
+DECISIONS*.md
+GOALS*.md
+JOURNAL*.md
+LESSONS*.md
+PRINCIPLES*.md
 
 # ---- 截图与临时验证文件 ----
 *.png

@@ -709,9 +709,51 @@ html[data-dsh-seat-tray="open"] #dsh-st-panel { display: flex; }
          ★ 如果 layoutApi 取不到 —— 那就干脆认为"面板页没开着"。
            因为 layoutApi 都没有的话，官方面板功能本身也用不了。 */
       try {
-        if (!layoutApi || !layoutApi.panelInfo) return false;
+        if (!layoutApi || !layoutApi.panelInfo) return panellistActiveByDom();
         var s = layoutApi.panelInfo.getSnapshot();
-        return !!(s && s.activePanelId !== null && s.activePanelId !== undefined);
+        var open = !!(s && s.activePanelId !== null && s.activePanelId !== undefined);
+        if (open) return true;
+        /* ★ 2026-10-21：官方 API 说"没开面板"，但 DOM 上**面板座位**有选中项 ⇒ 仍算面板页。
+           为什么需要这条：官方 API 与 DOM 偶尔不同步（面板刚点开的那一帧、
+           或第三方插件自己切路由时）。用户报的就是"在这些页上按返回直接回桌面"。 */
+        return panellistActiveByDom();
+      } catch (e) { return panellistActiveByDom(); }
+    }
+
+    /* ★★★ 2026-10-21（用户要求）：「涵盖一下和他们一模一样的座位的按钮，返回键应该都是
+       直接返回主界面的，但是不要扩大太多，也就是说要实际上完完全全和他们是一个类型的按钮。」
+
+       ⇒ 这里只认**面板座位**（官方 `sidebar.panellist` 槽）里的条目：
+         · 座位容器 = 包含「插件」「自动化任务」这两个官方入口的那个块（动态探测，不写死 class）
+         · 选中态 = 该容器内带 `aria-current="page"` 的条目（真机实测：插件按钮就是它）
+         · 排除「对话」—— 那本身就是主界面，不是面板页
+       这样任何第三方插件（例如插件市场）注册到**同一座位**的按钮都自动覆盖，
+       **不需要知道它叫什么名字**，也不会把侧栏里其它类型的按钮卷进来。 */
+    function panellistActiveByDom() {
+      try {
+        var col = document.querySelector('[class*="sidebarCol"]');
+        if (!col) return false;
+        var seat = null;
+        var btns = col.querySelectorAll('button, a, [role="button"], [role="menuitem"]');
+        for (var i = 0; i < btns.length; i++) {
+          var t = ((btns[i].getAttribute("aria-label") || "") + " " + (btns[i].textContent || ""))
+                    .replace(/\s+/g, "");
+          if (/插件|自动化任务|automation/i.test(t)) {
+            /* 取"插件"所在的那个直接父容器作为座位 */
+            seat = btns[i].parentElement;
+            if (seat && seat.querySelectorAll('button, a, [role="button"]').length >= 2) break;
+            seat = btns[i].parentElement;
+          }
+        }
+        if (!seat) return false;
+        var act = seat.querySelectorAll('[aria-current="page"]');
+        for (var j = 0; j < act.length; j++) {
+          var lab = ((act[j].getAttribute("aria-label") || "") + " " + (act[j].textContent || ""))
+                      .replace(/\s+/g, "");
+          if (/^(对话|会话|聊天|chat|conversation)$/i.test(lab)) return false;
+          return true;      /* 座位里有选中项，且不是"对话" ⇒ 在面板页 */
+        }
+        return false;
       } catch (e) { return false; }
     }
 
@@ -725,18 +767,30 @@ html[data-dsh-seat-tray="open"] #dsh-st-panel { display: flex; }
 
     /** 面板页 → 回对话。返回 true 表示确实做了事。 */
     function backToConversation() {
-      /* ① 首选官方 API（最干净） */
+      /* ① 首选官方 API（最干净）。
+         ★ 2026-10-21：判据从 `panelIsOpen()` 改成**直接看 activePanelId**。
+           原因：panelIsOpen() 现在可能因 DOM 兜底而为 true，但那时官方并没有
+           真正的 activePanelId —— 直接调 selectPanel(null) 会是空操作，
+           却仍然 `return true`，等于**把返回键吃掉但页面没动**。
+           ⇒ 只有官方确实有 activePanelId 时才走这条路。 */
       try {
-        if (layoutApi && panelIsOpen()) {
-          layoutApi.selectPanel(null);
-          syncPanelOpen();
-          return true;
+        if (layoutApi && layoutApi.panelInfo) {
+          var st = layoutApi.panelInfo.getSnapshot();
+          var id = st ? st.activePanelId : null;
+          if (id !== null && id !== undefined) {
+            layoutApi.selectPanel(null);
+            syncPanelOpen();
+            return true;
+          }
         }
       } catch (e) {}
       /* ② ★★ 兜底（2026-10-20）：layoutApi 取不到 / 调不动时，
-            从 DOM 上把面板页关掉 —— 点一下侧栏里的"对话"入口。
+            从 DOM 上把面板页关掉 —— 点一下「对话」入口。
             ★ 这是用户报「插件/自动化任务页按返回回桌面」的最后一道保险：
-              宁可多点一次 DOM，也不能让返回键掉到 App 去退到桌面。 */
+              宁可多点一次 DOM，也不能让返回键掉到 App 去退到桌面。
+            ★ 2026-10-21：选择器里的 `[role="tab"]` 是**全局**的 ——
+              面板页里侧栏的「对话」入口可能不存在，而主区的「对话」页签存在，
+              两种都试，找到哪个点哪个。 */
       try {
         if (!panelIsOpen()) return false;
         var cands = document.querySelectorAll(

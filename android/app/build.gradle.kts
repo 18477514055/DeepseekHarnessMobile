@@ -25,8 +25,19 @@ android {
         //   本方案的容器能力上限因此与 Termux **完全一致**。
         // ★ 代价：不能上架 Google Play（侧载分发不受影响）。
         targetSdk = 28
-        versionCode = 6
-        versionName = "1.0.5"
+        // 1.0.6：修「容器内 DNS 全废 ⇒ 插件下载不了 / npm pnpm apt 全部卡死」。
+        //   根因是 1.0.5 重打 rootfs 时把 PC 上 Debian WSL 的 /etc/resolv.conf
+        //   （nameserver 10.255.255.254）打进了包，那个地址在手机上不存在。
+        //   修法：新增 ResolvConf，每次起 proot 前按宿主当前网络重写 resolv.conf。
+        // ★ 1.0.6 只在本机装过、**从未发布**，直接跳到 1.0.7。
+        //
+        // 1.0.7：修「插件页 / 自动化任务页 / 插件市场页按返回键直接退到桌面」。
+        //   根因 MainActivity.webShown 从来没被置 true ⇒ onBackPressed 第一行就
+        //   moveTaskToBack，插件的 window.__dshBack() 从没被调用过。
+        //   （1.0.5 重构 showWeb 不再自动进 DSH 时丢的置位）
+        //   同时插件侧把「面板座位」的 DOM 兜底补上（同座位的第三方按钮一并覆盖）。
+        versionCode = 8
+        versionName = "1.0.7"
         // 只发 arm64（用户手机是 arm64-v8a；也省体积）
         ndk { abiFilters += "arm64-v8a" }
     }

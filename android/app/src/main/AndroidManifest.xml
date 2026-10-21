@@ -2,6 +2,13 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
     <uses-permission android:name="android.permission.INTERNET" />
+    <!--
+      ★ 2026-10-21：ResolvConf 要读宿主当前网络的 DNS
+      （ConnectivityManager.getAllNetworks + getLinkProperties().getDnsServers()）。
+      这是 normal 级权限，安装时自动授予、不弹窗。
+      缺了它只是退回公共 DNS（223.5.5.5 等），不会崩、不会拦住容器启动。
+    -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />

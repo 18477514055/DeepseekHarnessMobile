@@ -247,6 +247,21 @@ final class ProotLauncher {
 
     /** 环境变量：env -i 的等价物。 */
     static void applyEnv(ProcessBuilder pb, Context c) {
+        /* ★★★ 2026-10-21：**所有** proot 启动都从这里过，所以 DNS 对齐放在这儿。
+         *
+         * 为什么不在 buildCommand() 里写：本项目有 **7 处** 起 proot 的地方 ——
+         *   ProotLauncher.buildCommand（主容器）· PtySession（独立终端）·
+         *   DshService:512 · AdbBridge:448 · RootfsInstaller:1010 / 1186（装机期）
+         * 逐个补必然漏。而它们**无一例外**都会调本方法，所以这里是唯一咽喉。
+         *
+         * 不写这一步会怎样（1.0.5 真机实测）：rootfs 里带着打包机（Debian WSL）的
+         * `nameserver 10.255.255.254` ⇒ 手机上 DNS 全废 ⇒ 容器内 npm / pnpm / apt /
+         * git clone 全部**无输出、无报错地卡死**，用户看到的就是"插件下载不了"。
+         * 详见 ResolvConf 类的注释。
+         *
+         * ★ 幂等且不抛异常：内容没变就不写；任何失败只记日志，绝不拦住容器启动。 */
+        ResolvConf.ensure(c);
+
         java.util.Map<String, String> env = pb.environment();
         env.clear();
         /* ★★★ 2026-10-20：PATH **必须含 /opt/node/bin**。
