@@ -19,13 +19,33 @@ android/app/src/main/assets/rootfs.gz.bin
 android/app/src/main/assets/pnpm-incr.gz.bin
 *.gz.bin
 
-# ---- 台账与本机工作残留（含手机序列号、本机绝对路径）----
+# ---- 台账与本机工作残留（含手机序列号、本机绝对路径、用户原话）----
+# ★★★ 2026-10-21 事故（§86）：这份清单曾经**漏了第 2 代记忆目录**。
+#
+#   当时只写了单文件 DECISIONS.md / GOALS.md —— 那是**第 1 代**的形状。
+#   后来记忆结构升到第 2 代，拆成 decisions/ lessons/ goals/ 一卡一文件，
+#   规则没跟着改 ⇒ 这三个目录 + LESSONS.md + PRINCIPLES.md **真被提交并推送了**。
+#   仓库是 **public**，所以那是真的外泄，不是"差点"。
+#
+#   ★ 根因是我"照记忆列清单"，没拿磁盘上真实文件去对。
+#     这正是本项目 §0.2 的"我写了规则 ≠ 规则生效"。
+#
+#   ⇒ 规矩：以后改 .gitignore 之后**必须跑一次核对命令**，
+#     把 `git ls-files` 里所有像记忆文件的路径列出来，确认是空的。
+#     命令见 README 或发布流程.md 的"提交前检查"。
 .dsh-ledger.json
 LEDGER.md
 DECISIONS.md
 GOALS.md
 JOURNAL.md
+LESSONS.md
+PRINCIPLES.md
+# ★ 一卡一文件的第 2 代目录（不带尾斜杠会漏掉子目录里的东西）
+/decisions/
+/lessons/
+/goals/
 _ledger-archive/
+_ledger-log/
 _stash/
 _handoff/
 
