@@ -135,7 +135,7 @@ public class MainActivity extends AppCompatActivity {
                    为什么：原来是 showWeb 里先 splash.GONE 再 loadUrl，
                    而 WebView 从 loadUrl 到真正发出请求要 8~9 秒（渲染进程冷启动），
                    这段时间 splash 已消失、页面还没画 ⇒ 用户看到的就是「黑屏 7~8 秒」。
-                   实测（JZQ8H6U46PBY9PV8）：showWeb 21:56:51.087 → PAGE_START 21:56:59.965，
+                   实测（真机 Android 16）：showWeb 21:56:51.087 → PAGE_START 21:56:59.965，
                    中间 8.9 秒全黑，而页面本身只用了 0.77 秒。
                    ⇒ 启动页必须压到「页面真的开始了」再收，宁可多留一会儿也不要露黑底。 */
                 revealWeb();
