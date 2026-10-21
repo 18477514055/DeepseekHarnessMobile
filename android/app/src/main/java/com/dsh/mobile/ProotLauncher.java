@@ -263,6 +263,31 @@ final class ProotLauncher {
         env.put("HOME", "/root");
         env.put("USER", "root");
         env.put("TERM", "dumb");
+
+        /* ★★★ 2026-10-21（§82）：**必须设 UTF-8 locale，否则中文全变 `M-x` 转义**。
+         *
+         * 真机取证（官方终端里截到的原文）：
+         *   root@localhost:~/M-fM- M--dM-=M-M
+         *   -M-=M-M-eM-          M-fM-M-:M-eM--M-M-
+         * `M-x` 是 readline 在 **8-bit/C locale** 下对非 ASCII 字节做的 meta 转义
+         * ——也就是说，乱码**发生在 xterm 收到字节之前**，xterm 本身没问题。
+         *
+         * 根因就在本方法：`env.clear()` 之后**从来没设过 LANG / LC_ALL**，
+         * glibc 于是退回 POSIX/C locale，bash 把每个高位字节当非法字符转义。
+         * ⇒ 不是官方的锅，是我们自己的容器少了环境变量。
+         *
+         * 取值用 **C.UTF-8**（glibc 内置，Debian 12+ 无需 locale-gen，
+         * 容器里没有生成的 en_US.UTF-8 也能直接用）。
+         * ★ 若某天真缺这个 locale，glibc 会**退回 C**，行为与修复前一致，
+         *   不会更坏 ⇒ 这条改动没有下行风险。
+         *
+         * ★ TERM 这里**故意保持 dumb 不动**：官方 `spawnTerminal` 会显式传
+         *   `terminalType:"xterm-256color"` 并用它覆盖 env.TERM
+         *   （dsh-subprocess-local: `env: {...env, TERM: spec.terminalType}`），
+         *   所以 PTY 那边拿到的永远是 xterm-256color；而改这里的 TERM 只会
+         *   让重定向到 proot.log 的服务端输出混进 ANSI 控制码，纯粹添乱。 */
+        env.put("LANG", "C.UTF-8");
+
         // ★ 这三个路径 proot 会自己去做文件操作，必须用 /data/data 形式
         env.put("PROOT_LOADER", Cfg.prootPathOf(new File(Cfg.libDir(c), "libproot-loader.so")));
         env.put("PROOT_LOADER_32", Cfg.prootPathOf(new File(Cfg.libDir(c), "libproot-loader32.so")));

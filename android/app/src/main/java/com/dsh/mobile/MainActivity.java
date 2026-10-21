@@ -72,6 +72,24 @@ public class MainActivity extends AppCompatActivity {
         s.setMixedContentMode(WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE);
         CookieManager.getInstance().setAcceptCookie(true);
 
+        /* ★★★ 2026-10-21（§82 排查）：打开 WebView 远程调试。
+         *
+         * 起因：手机上的官方终端「新建终端」一直卡在「正在读取终端环境…」，
+         * 停在 `remote.terminal.environment()` 不返回。logcat 里什么都没有，
+         * web.log 只有插件自己的 2 秒 dump —— **门外看不到里面的报错**。
+         *
+         * 唯一还能拿到真实报错的通道就是 CDP：
+         *   adb forward tcp:9222 localabstract:webview_devtools_remote_<pid>
+         *   → /json → Runtime.evaluate 读状态 / 听 console 与 exception
+         *
+         * ★ 本 App 本来就是 sideload 分发，且此前已经吃过「release 没有诊断信息」
+         *   的亏（§0.2 那条「release 版必须有外置日志」的同一笔账）。
+         * ★ 要用时先 `pidof com.dsh.mobile`，socket 名带的是**进程号**。
+         * ★ 要关：删这几行即可，不影响任何功能。 */
+        try {
+            android.webkit.WebView.setWebContentsDebuggingEnabled(true);
+        } catch (Throwable ignored) { }
+
         webView.setWebViewClient(new WebViewClient() {
             @Override
             public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest req) {
